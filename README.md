@@ -2,6 +2,8 @@
 
 2D reaction-diffusion simulation of a two-strain cooperative microbial consortium (CoA + CoB), implemented in PyTorch.
 
+![Flow-through bioreactor simulation](flow_through.gif)
+
 ## Quick Start
 
 ```python
