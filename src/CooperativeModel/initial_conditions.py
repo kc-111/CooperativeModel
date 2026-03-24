@@ -1,10 +1,30 @@
 """Initial condition generators for the 2D bioreactor model.
 
-All functions return a [1, 8, Ny, Nx] tensor with channel ordering:
+All functions return a [B, 8, Ny, Nx] tensor with channel ordering:
     [N1, N2, Sn, L, F1, F2, F3, F4]
+
+When all parameters are scalars, B=1 (single sample).  Parameters can also
+be 1-D sequences or tensors of length B for multi-sample simulations.
 """
 
 import torch
+
+
+def _infer_batch_size(values):
+    """Return B from a list of scalar-or-array values, checking consistency."""
+    B = 1
+    for v in values:
+        if not isinstance(v, (int, float)):
+            n = len(v) if not isinstance(v, torch.Tensor) else v.numel()
+            if n <= 1:
+                continue
+            if B == 1:
+                B = n
+            elif n != B:
+                raise ValueError(
+                    f"Array IC parameters must all have the same length; "
+                    f"got {B} and {n}")
+    return B
 
 
 def uniform(grid_cfg, N1=0.05, N2=0.05, Sn=0.0, L=0.0,
@@ -12,12 +32,20 @@ def uniform(grid_cfg, N1=0.05, N2=0.05, Sn=0.0, L=0.0,
             device='cpu', dtype=torch.float64):
     """Spatially uniform initial conditions (well-mixed).
 
-    With no advection, the 2D model should recover the ODE solution.
+    Each parameter can be a scalar (single sample) or a 1-D sequence/tensor
+    of length B (multiple samples).  Returns [B, 8, Ny, Nx].
     """
     Ny, Nx = grid_cfg.Ny, grid_cfg.Nx
-    state = torch.zeros(1, 8, Ny, Nx, device=device, dtype=dtype)
-    for i, v in enumerate([N1, N2, Sn, L, F1, F2, F3, F4]):
-        state[:, i] = v
+    values = [N1, N2, Sn, L, F1, F2, F3, F4]
+    B = _infer_batch_size(values)
+
+    state = torch.zeros(B, 8, Ny, Nx, device=device, dtype=dtype)
+    for i, v in enumerate(values):
+        v_t = torch.as_tensor(v).to(device=device, dtype=dtype).flatten()
+        if v_t.numel() == 1:
+            state[:, i] = v_t.item()
+        else:
+            state[:, i] = v_t.reshape(B, 1, 1)
     return state
 
 
@@ -166,6 +194,7 @@ def random_inoculation(grid_cfg, n_colonies=6, colony_radius=0.08,
                        N1_amount=0.1, N2_amount=0.1,
                        Sn=0.0, L=0.0,
                        F1=0.0, F2=0.0, F3=0.0, F4=0.0,
+                       n_samples=1,
                        device='cpu', dtype=torch.float64):
     """Scatter small bacterial colonies at random positions.
 
@@ -174,43 +203,62 @@ def random_inoculation(grid_cfg, n_colonies=6, colony_radius=0.08,
     so some colonies may be N1-dominant, others N2-dominant.  Nutrients
     are set uniformly (e.g. trace background or zero).
 
+    When ``n_samples > 1``, each sample gets independently randomised
+    colony placements.  Scalar parameters are broadcast; 1-D sequences
+    of length ``n_samples`` give per-sample values.
+
     Args:
         grid_cfg: GridConfig instance.
-        n_colonies: Number of colonies to place.
+        n_colonies: Number of colonies to place per sample.
         colony_radius: Gaussian sigma of each colony [cm].
         N1_amount: Peak concentration scale for CoA per colony.
         N2_amount: Peak concentration scale for CoB per colony.
         Sn, L, F1..F4: Uniform background values for non-bacterial fields.
+        n_samples: Number of independent samples to generate.
+
+    Returns:
+        [n_samples, 8, Ny, Nx] tensor.
     """
     Ny, Nx = grid_cfg.Ny, grid_cfg.Nx
     dx, dy = grid_cfg.dx, grid_cfg.dy
     Lx, Ly = grid_cfg.Lx, grid_cfg.Ly
+    B = n_samples
 
     x = torch.linspace(0.5 * dx, Lx - 0.5 * dx, Nx, device=device, dtype=dtype)
     y = torch.linspace(0.5 * dy, Ly - 0.5 * dy, Ny, device=device, dtype=dtype)
     Y, X = torch.meshgrid(y, x, indexing='ij')
 
-    state = torch.zeros(1, 8, Ny, Nx, device=device, dtype=dtype)
+    # Broadcast helper: scalar → [B], array → [B]
+    def _to_B(v):
+        t = torch.as_tensor(v).to(device=device, dtype=dtype).flatten()
+        if t.numel() == 1:
+            return t.expand(B)
+        return t
 
-    # Uniform backgrounds for non-bacterial channels
-    state[:, 2] = Sn
-    state[:, 3] = L
-    state[:, 4] = F1
-    state[:, 5] = F2
-    state[:, 6] = F3
-    state[:, 7] = F4
+    N1_amt = _to_B(N1_amount)
+    N2_amt = _to_B(N2_amount)
 
-    # Random colonies
-    for _ in range(n_colonies):
-        cx = torch.rand(1, device=device, dtype=dtype).item() * Lx
-        cy = torch.rand(1, device=device, dtype=dtype).item() * Ly
-        blob = torch.exp(-((X - cx)**2 + (Y - cy)**2) / (2 * colony_radius**2))
+    state = torch.zeros(B, 8, Ny, Nx, device=device, dtype=dtype)
 
-        # Random fraction of N1 vs N2 per colony
-        frac = torch.rand(1, device=device, dtype=dtype).item()
-        peak_N1 = N1_amount * (0.2 + 1.6 * frac)       # varies 0.2x – 1.8x
-        peak_N2 = N2_amount * (0.2 + 1.6 * (1 - frac))
-        state[:, 0] += peak_N1 * blob
-        state[:, 1] += peak_N2 * blob
+    # Uniform backgrounds (per-sample broadcasting)
+    for ch, val in [(2, Sn), (3, L), (4, F1), (5, F2), (6, F3), (7, F4)]:
+        v_t = torch.as_tensor(val).to(device=device, dtype=dtype).flatten()
+        if v_t.numel() == 1:
+            state[:, ch] = v_t.item()
+        else:
+            state[:, ch] = v_t.reshape(B, 1, 1)
+
+    # Random colonies — independent per sample
+    for s in range(B):
+        for _ in range(n_colonies):
+            cx = torch.rand(1, device=device, dtype=dtype).item() * Lx
+            cy = torch.rand(1, device=device, dtype=dtype).item() * Ly
+            blob = torch.exp(-((X - cx)**2 + (Y - cy)**2) / (2 * colony_radius**2))
+
+            frac = torch.rand(1, device=device, dtype=dtype).item()
+            peak_N1 = N1_amt[s].item() * (0.2 + 1.6 * frac)
+            peak_N2 = N2_amt[s].item() * (0.2 + 1.6 * (1 - frac))
+            state[s, 0] += peak_N1 * blob
+            state[s, 1] += peak_N2 * blob
 
     return state

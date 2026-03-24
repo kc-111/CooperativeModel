@@ -120,12 +120,12 @@ def simulate(config, initial_state, velocity_field=None):
 
     Args:
         config: ``SimulationConfig`` instance.
-        initial_state: ``[1, 8, Ny, Nx]`` initial condition tensor.
-        velocity_field: Optional ``[1, 2, Ny, Nx]`` velocity field.
-                        Defaults to zero (pure diffusion).
+        initial_state: ``[B, 8, Ny, Nx]`` initial condition tensor.
+        velocity_field: Optional ``[1, 2, Ny, Nx]`` velocity field
+                        (broadcasts over B).  Defaults to zero (pure diffusion).
 
     Returns:
-        results: ``[1, n_output, 8, Ny, Nx]`` solution tensor.
+        results: ``[B, n_output, 8, Ny, Nx]`` solution tensor.
         t_eval:  ``[n_output]`` time points.
     """
     device = config.device
@@ -146,7 +146,8 @@ def simulate(config, initial_state, velocity_field=None):
 
     # Initial state → flat
     y0_spatial = initial_state.to(device=device, dtype=dtype)
-    y0_flat = y0_spatial.reshape(1, -1)  # [1, 8*H*W]
+    B = y0_spatial.shape[0]
+    y0_flat = y0_spatial.reshape(B, -1)  # [B, 8*H*W]
 
     # Build RHS
     rhs = BioreactorRHS(params, grid, D, vel)
@@ -173,7 +174,7 @@ def simulate(config, initial_state, velocity_field=None):
     # Solve
     results_flat = solver.solve(rhs, y0_flat, t_span, t_eval,
                                 args=None, h0=h0)
-    # results_flat: [1, n_output, 8*H*W]
+    # results_flat: [B, n_output, 8*H*W]
 
-    results = results_flat.reshape(1, len(t_eval), 8, grid.Ny, grid.Nx)
+    results = results_flat.reshape(B, len(t_eval), 8, grid.Ny, grid.Nx)
     return results, t_eval
