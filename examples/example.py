@@ -26,6 +26,7 @@ r = Simulator(
     omega=-0.25, diffusion_scale=0.1, flow_rate=5.0,
     device='cuda'
 ).run()
+print(r.final_values()) # This contains the final values for each sample
 end_time = time.time()
 print(f'Flow-through time: {end_time - start_time:.2f} seconds')
 print(f'Samples: {r.n_samples}')
