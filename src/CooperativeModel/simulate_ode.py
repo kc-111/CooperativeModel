@@ -167,7 +167,10 @@ class Simulator:
         N1, N2, Sn, L, F1, F2, F3, F4: Initial concentrations (ODE variables).
             Each can be a scalar (one sample) or a 1-D list/array/tensor of
             length B (multiple samples).  Scalars are broadcast to match.
-            Default feed: F4=100 (maltose), others zero.
+            In ``mode='batch'`` these are the initial amounts at t=0 in a
+            sealed reactor (no inlet, no outlet).  In ``mode='flow_through'``
+            the F1..F4 values are reused as the inlet stream concentrations.
+            Defaults: N1=N2=0.05, F4=100 (maltose), others zero.
         samples: Optional ``[B, 8]`` tensor (or nested list) specifying all 8
             IC values for B samples at once.  Overrides the individual
             N1..F4 parameters when provided.  Column order is
