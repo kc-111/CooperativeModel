@@ -23,8 +23,8 @@ import time
 import torch
 
 from .config import SimulationConfig, GridConfig, SolverConfig, DiffusionConfig
-from .initial_conditions import uniform, random_inoculation
-from .velocity_fields import rigid_body_vortex
+from .initial_conditions import uniform, random_inoculation, stratified_inoculation
+from .velocity_fields import bioreactor_flow
 from .model import BioreactorRHS, simulate, compute_cfl_limit
 from .tsit5_solver import Tsit5SolverTorch
 
@@ -179,7 +179,8 @@ class Simulator:
         t_final: Integration time [hours]. Default 72.
         n_output: Number of output time points. Default 145.
         grid_size: Spatial grid points per side. Default 100.
-        omega: Vortex angular velocity [rad/h]. Default -0.25 (clockwise).
+        U_imp: Peak speed of the steady single-impeller mean flow [cm/h].
+            Default 0.5. Set to 0 for a quiescent (no-stirring) reactor.
         diffusion_scale: Multiplier on all diffusion coefficients.
             Default 0.1 (10x slower than physical). 1.0 = physical.
         flow_rate: Turnover rate in inlet/outlet zones [h^-1].
@@ -207,14 +208,14 @@ class Simulator:
                  F1=0.0, F2=0.0, F3=0.0, F4=100.0,
                  *, samples=None,
                  mode='flow_through', t_final=72.0, n_output=145, grid_size=100,
-                 omega=-0.25, diffusion_scale=0.1,
+                 U_imp=0.5, diffusion_scale=0.1,
                  flow_rate=5.0, n_colonies=8, device='cpu'):
         self._ic = self._normalize_ic(N1, N2, Sn, L, F1, F2, F3, F4, samples)
         self.mode = mode
         self.t_final = t_final
         self.n_output = n_output
         self.grid_size = grid_size
-        self.omega = omega
+        self.U_imp = U_imp
         self.diffusion_scale = diffusion_scale
         self.flow_rate = flow_rate
         self.n_colonies = n_colonies
@@ -302,8 +303,8 @@ class Simulator:
         dtype = torch.float64
 
         y0 = uniform(grid, device=self.device, dtype=dtype, **self.ic)
-        vel = (rigid_body_vortex(grid, omega=self.omega, device=self.device, dtype=dtype)
-               if self.omega != 0.0 else None)
+        vel = (bioreactor_flow(grid, U_imp=self.U_imp, device=self.device, dtype=dtype)
+               if self.U_imp != 0.0 else None)
 
         t0 = time.time()
         results, t_eval = simulate(config, y0, velocity_field=vel)
@@ -322,15 +323,25 @@ class Simulator:
         B = self.n_samples
         ic_vals = self._ic  # [B, 8]
 
-        vel = rigid_body_vortex(grid, omega=self.omega if self.omega != 0.0 else -2.0,
-                                device=self.device, dtype=dtype)
+        U_imp = self.U_imp if self.U_imp != 0.0 else 0.5
+        vel = bioreactor_flow(grid, U_imp=U_imp,
+                              device=self.device, dtype=dtype)
 
-        # Inlet/outlet corner zones
-        corner = max(grid.Nx // 10, 4)
+        # Inlet (top-left) and outlet (bottom-right) corner zones. With
+        # origin='lower' visualisation, high-row = top and low-row = bottom.
+        corner = 1#max(grid.Nx // 10, 4)
         inlet_mask = torch.zeros(1, 1, H, W, device=self.device, dtype=dtype)
         inlet_mask[:, :, H - corner:, :corner] = 1.0
         outlet_mask = torch.zeros(1, 1, H, W, device=self.device, dtype=dtype)
         outlet_mask[:, :, :corner, W - corner:] = 1.0
+
+        # Outlet drain: small advective drift inside the outlet patch on
+        # top of the mean flow, pushing toward the bottom-right corner so
+        # upwind advection with replicate-pad BCs carries mass off-grid.
+        v_drain = 0.2 * U_imp
+        vel = vel.clone()
+        vel[:, 0, :corner, W - corner:] += v_drain    # +x toward right wall
+        vel[:, 1, :corner, W - corner:] -= v_drain    # -y toward bottom wall
 
         # Feed: nutrients only (from the IC nutrient values, per sample)
         c_feed = torch.zeros(B, 8, 1, 1, device=self.device, dtype=dtype)
@@ -339,8 +350,18 @@ class Simulator:
         c_feed[:, 6, 0, 0] = ic_vals[:, 6]  # F3
         c_feed[:, 7, 0, 0] = ic_vals[:, 7]  # F4
 
-        # IC: random bacterial colonies + trace nutrients (independent per sample)
-        y0 = random_inoculation(
+        # IC: stratified (uniformly placed) bacterial colonies + trace nutrients.
+        # The random-inoculation version below is left commented out for reference.
+        # y0 = random_inoculation(
+        #     grid, n_colonies=self.n_colonies,
+        #     N1_amount=ic_vals[:, 0], N2_amount=ic_vals[:, 1],
+        #     F1=ic_vals[:, 4] * 0.05, F2=ic_vals[:, 5] * 0.05,
+        #     F3=ic_vals[:, 6] * 0.05, F4=ic_vals[:, 7] * 0.05,
+        #     colony_radius=grid.Lx * 0.06,
+        #     n_samples=B,
+        #     device=self.device, dtype=dtype,
+        # )
+        y0 = stratified_inoculation(
             grid, n_colonies=self.n_colonies,
             N1_amount=ic_vals[:, 0], N2_amount=ic_vals[:, 1],
             F1=ic_vals[:, 4] * 0.05, F2=ic_vals[:, 5] * 0.05,

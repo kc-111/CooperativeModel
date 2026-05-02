@@ -190,6 +190,80 @@ def edge_concentrated(grid_cfg, edge='left', decay_length=0.15, noise_frac=0.05,
     return state
 
 
+def stratified_inoculation(grid_cfg, n_colonies=6, colony_radius=0.08,
+                            N1_amount=0.1, N2_amount=0.1,
+                            Sn=0.0, L=0.0,
+                            F1=0.0, F2=0.0, F3=0.0, F4=0.0,
+                            n_samples=1,
+                            device='cpu', dtype=torch.float64):
+    """Place colonies on a uniform (stratified) grid — deterministic counterpart
+    of :func:`random_inoculation`.
+
+    The colony positions are chosen as the cell centres of a roughly-square
+    grid that fits ``n_colonies`` cells inside the domain.  Each colony gets
+    the same N1 and N2 amounts, and positions are identical across samples.
+
+    Args:
+        grid_cfg, colony_radius, Sn..F4: as in :func:`random_inoculation`.
+        n_colonies: Number of colonies (placed on an nx×ny grid where
+            nx*ny == n_colonies and the layout is the most square pair of
+            factors).  Falls back to nearest factor pair if ``n_colonies``
+            is prime — in that case one row of ``n_colonies`` colonies.
+        N1_amount, N2_amount: Peak per-colony amounts (scalar or [B] array).
+        n_samples: Number of samples (positions are shared across samples;
+            only N1/N2 amounts may differ per sample).
+
+    Returns:
+        [n_samples, 8, Ny, Nx] tensor.
+    """
+    Ny, Nx = grid_cfg.Ny, grid_cfg.Nx
+    dx, dy = grid_cfg.dx, grid_cfg.dy
+    Lx, Ly = grid_cfg.Lx, grid_cfg.Ly
+    B = n_samples
+
+    x = torch.linspace(0.5 * dx, Lx - 0.5 * dx, Nx, device=device, dtype=dtype)
+    y = torch.linspace(0.5 * dy, Ly - 0.5 * dy, Ny, device=device, dtype=dtype)
+    Y, X = torch.meshgrid(y, x, indexing='ij')
+
+    def _to_B(v):
+        t = torch.as_tensor(v).to(device=device, dtype=dtype).flatten()
+        if t.numel() == 1:
+            return t.expand(B)
+        return t
+
+    N1_amt = _to_B(N1_amount)
+    N2_amt = _to_B(N2_amount)
+
+    state = torch.zeros(B, 8, Ny, Nx, device=device, dtype=dtype)
+    for ch, val in [(2, Sn), (3, L), (4, F1), (5, F2), (6, F3), (7, F4)]:
+        v_t = torch.as_tensor(val).to(device=device, dtype=dtype).flatten()
+        if v_t.numel() == 1:
+            state[:, ch] = v_t.item()
+        else:
+            state[:, ch] = v_t.reshape(B, 1, 1)
+
+    # Pick the most-square (ny, nx) factorisation of n_colonies
+    ny_g = max(int(round(n_colonies ** 0.5)), 1)
+    while ny_g > 1 and n_colonies % ny_g != 0:
+        ny_g -= 1
+    nx_g = n_colonies // ny_g
+    if nx_g < ny_g:
+        nx_g, ny_g = ny_g, nx_g
+
+    N1_view = N1_amt.reshape(B, 1, 1)
+    N2_view = N2_amt.reshape(B, 1, 1)
+    for i in range(nx_g):
+        for j in range(ny_g):
+            cx = (i + 0.5) * Lx / nx_g
+            cy = (j + 0.5) * Ly / ny_g
+            blob = torch.exp(-((X - cx) ** 2 + (Y - cy) ** 2)
+                             / (2 * colony_radius ** 2))
+            state[:, 0] += N1_view * blob
+            state[:, 1] += N2_view * blob
+
+    return state
+
+
 def random_inoculation(grid_cfg, n_colonies=6, colony_radius=0.08,
                        N1_amount=0.1, N2_amount=0.1,
                        Sn=0.0, L=0.0,

@@ -1,199 +1,132 @@
-"""Global constrained optimization for L_final(F1..F4) over [0, 100]^4.
+"""Find local maxima of L_final over (F1, F2, F3, F4) in [0, 100]^4.
 
-Problem (`objective.py`):
-    maximise   L_final(F)
-    subject to F ∈ [0, 100]^4         (box bounds)
+Closed-batch ODE model: F1..F4 are the initial sugar amounts loaded at t=0;
+N1, N2 are fixed inocula; we maximise the spatially-averaged L (lactic acid)
+at t = t_final.
 
-Algorithm: batched-multistart with projected gradient ascent.
+Pipeline:
+    1. Batched landscape scan over many random points (cheap with grid_size=1).
+    2. Greedy epsilon-separated selection of the top peaks.
+    3. scipy.optimize.minimize (L-BFGS-B with box constraints [0, 100]) from
+       each selected peak.
+    4. Dedup refined optima by Euclidean distance.
 
-Why not scipy.optimize.shgo (the textbook "find all local minima" tool)?
-We tried it — see `objective.py` for the SHGO-compatible `neg_with_grad`
-interface.  SHGO is the correct *abstract* algorithm for this problem
-(Sobol-sample → simplicial homology → L-BFGS-B from each minimiser
-candidate), but it serialises the L-BFGS-B inner loop.  Each call to our
-objective creates a fresh `Simulator(...)` with 9 samples and ~1 s setup
-overhead per call; SHGO at `n=256, iters=1, maxiter=30` makes thousands of
-these serial calls and runs for hours.  The custom batched ascent below
-exploits the fact that 100 candidates × 9 perturbations = 900 samples in a
-SINGLE Simulator call costs the same as 9 samples — so batching across
-*candidates* (not just across FD perturbations) gives a ~100× speedup.
-
-The algorithm is morally identical to SHGO with sobol sampling:
-  1. Sample 200k Sobol + 16 corner points, batched in one Simulator call.
-  2. Greedy ε-separated peak selection — discrete analogue of the
-     "minimiser candidate" check (lower than every neighbour).
-  3. Projected gradient ascent on all K candidates simultaneously: each
-     outer iteration is one Simulator call evaluating 9·K perturbed
-     points (the candidate plus 8 axis perturbations) followed by a
-     batched backtracking line search.
-  4. Re-dedupe + corner augmentation.
-  5. Gradient + Hessian + discrete-max classification (verify_optima.py)
-     to certify INTERIOR / BOUNDARY maxima.
-
-If `Simulator` ever gains a persistent / low-overhead invocation, swap
-this script back to `scipy.optimize.shgo` — the `Objective` class already
-supports it via `obj.neg_with_grad`.
+Usage:
+    python examples/find_optima.py
 """
 
 import sys, os, time, itertools
 import numpy as np
+from scipy.optimize import minimize
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from objective import Objective
-from verify_optima import grad_hess, classify, KIND_COLOR
+from CooperativeModel import Simulator
 
+# ── Config ──────────────────────────────────────────────────────────────
+N1, N2, Sn, L0 = 0.05, 0.05, 0.0, 0.0
+T_FINAL = 48.0
+BOUNDS = [(0.0, 10.0)] * 4
+EPSILON = 1.0          # min Euclidean distance between distinct optima
+N_RANDOM = 30       # random points for landscape scan
+N_TOP = 30              # number of seeded peaks to refine
+DEVICE = 'cuda'         # 'cpu' if no GPU
+SEED = 42
+U_imp = 0.5
 
-# ── Search settings ─────────────────────────────────────────────────────────
-N_SCAN     = 200_000     # Sobol scan size
-N_TOP      = 100         # candidates carried into refinement
-EPSILON    = 15.0        # min L2 separation between distinct optima
-N_ITER     = 30          # batched gradient-ascent outer iterations
-H_REFINE   = 2.0         # FD step during refinement
-H_VERIFY   = 2.0         # FD step for classifier
-
-
-# ── Build the optimization problem ──────────────────────────────────────────
-obj = Objective(t_final=72.0, N1=0.05, N2=0.05, device='cuda', fd_h=H_REFINE)
-
-
-def batched_gradient_ascent(s_arr, n_iter=N_ITER, h=H_REFINE):
-    """Project-gradient-ascent K candidates in lockstep with batched FD.
-
-    Per outer iter: one Simulator call on 9·K points (each candidate plus
-    its 8 axis perturbations), then a backtracking line search done in
-    batched groups of K.  Total: ~3-5 Simulator calls per outer iter,
-    each batched.
-    """
-    K = len(s_arr)
-    s = np.asarray(s_arr, dtype=float).clip(0, 100).copy()
-    L_now = obj.evaluate_batch(s)
-    alpha = np.full(K, 30.0)
-
-    for _ in range(n_iter):
-        h_eff = np.minimum.reduce([np.full((K, 4), h), s, 100 - s])
-        h_eff = np.where(h_eff <= 0, h, h_eff)
-        pts = [s.copy()]
-        for i in range(4):
-            sp = s.copy(); sp[:, i] = np.minimum(s[:, i] + h_eff[:, i], 100); pts.append(sp)
-            sm = s.copy(); sm[:, i] = np.maximum(s[:, i] - h_eff[:, i], 0);   pts.append(sm)
-        big = np.vstack(pts)
-        Lvals = obj.evaluate_batch(big).reshape(9, K)
-        L_now = Lvals[0]
-        g = np.zeros((K, 4))
-        for i in range(4):
-            g[:, i] = (Lvals[1+2*i] - Lvals[2+2*i]) / (2 * h_eff[:, i])
-        gn = np.linalg.norm(g, axis=1, keepdims=True)
-        d  = g / np.where(gn > 1e-9, gn, 1.0)
-
-        active = (gn[:, 0] > 1e-3)
-        for _ in range(6):
-            if not active.any():
-                break
-            s_try = (s + alpha[:, None] * d).clip(0, 100)
-            L_try = obj.evaluate_batch(s_try)
-            improved = (L_try > L_now + 1e-4) & active
-            s = np.where(improved[:, None], s_try, s)
-            L_now = np.where(improved, L_try, L_now)
-            alpha = np.where(improved, np.minimum(alpha * 1.5, 50.0), alpha * 0.5)
-            active = active & ~improved
-        if (alpha < 0.05).all():
-            break
-
-    return s, L_now
+def eval_batch(sugars):
+    """Vectorised L_final for sugars of shape [B, 4]."""
+    sugars = np.asarray(sugars, dtype=float).reshape(-1, 4)
+    B = len(sugars)
+    samples = np.zeros((B, 8))
+    samples[:, 0] = N1
+    samples[:, 1] = N2
+    samples[:, 2] = Sn
+    samples[:, 3] = L0
+    samples[:, 4:] = sugars
+    r = Simulator(
+        samples=samples.tolist(),
+        mode='flow_through', t_final=T_FINAL, grid_size=32,
+        U_imp=U_imp, diffusion_scale=0.1, flow_rate=0.05,
+        device=DEVICE,
+    ).run()
+    return np.atleast_1d(np.asarray(r.L_final))
 
 
-def greedy_eps_separated(points, scores, epsilon, k_max=None):
+def neg_L(x):
+    """Negative L_final for a single point — used by scipy.optimize."""
+    return -float(eval_batch(np.asarray(x).reshape(1, 4))[0])
+
+
+def greedy_select(points, scores, epsilon, k):
+    """Pick up to k points greedily, scoring high to low, with min separation."""
     order = np.argsort(scores)[::-1]
-    kept = []
+    chosen = []
     for idx in order:
         p = points[idx]
-        if all(np.linalg.norm(p - q) >= epsilon for q, _ in kept):
-            kept.append((p.copy(), float(scores[idx])))
-            if k_max is not None and len(kept) >= k_max:
+        if all(np.linalg.norm(p - points[j]) >= epsilon for j, _ in chosen):
+            chosen.append((idx, scores[idx]))
+            if len(chosen) >= k:
                 break
-    return kept
+    return chosen
 
 
-# ── Phase 1: Sobol scan ─────────────────────────────────────────────────────
-print(f'Phase 1 — Sobol scan, N={N_SCAN}')
-from scipy.stats.qmc import Sobol
-sob = Sobol(d=4, scramble=True, seed=42)
-m = int(np.ceil(np.log2(N_SCAN)))
-F_scan = 100.0 * sob.random_base2(m=m)[:N_SCAN]
-corners = np.array(list(itertools.product([0., 100.], repeat=4)))
-F_scan = np.vstack([corners, F_scan])
-t0 = time.time()
-L_scan = obj.evaluate_batch(F_scan)
-print(f'  {len(F_scan)} pts in {time.time()-t0:.1f}s, '
-      f'best={L_scan.max():.3f}')
+def main():
+    rng = np.random.default_rng(SEED)
+
+    # ── Step 1: landscape scan (random interior + 16 corners) ──────────
+    print(f'Landscape scan: {N_RANDOM} random + 16 corner points...')
+    t0 = time.time()
+    random_pts = rng.uniform(0, 100, size=(N_RANDOM, 4))
+    corners = np.array(list(itertools.product([0.0, 100.0], repeat=4)))
+    all_pts = np.vstack([corners, random_pts])
+    all_L = eval_batch(all_pts)
+    print(f'  scan: {time.time() - t0:.1f}s  ({len(all_pts)} evaluations)')
+
+    # ── Step 2: epsilon-separated seeds ────────────────────────────────
+    seeds = greedy_select(all_pts, all_L, EPSILON, N_TOP)
+    print(f'Selected {len(seeds)} epsilon-separated seeds (eps={EPSILON})')
+
+    # ── Step 3: L-BFGS-B refinement from each seed ─────────────────────
+    print(f'Refining with scipy.optimize.minimize (L-BFGS-B)...')
+    t0 = time.time()
+    refined = []
+    for idx, _ in seeds:
+        x0 = all_pts[idx]
+        res = minimize(
+            neg_L, x0=x0, method='L-BFGS-B',
+            bounds=BOUNDS,
+            options={'maxiter': 1000, 'ftol': 1e-9, 'gtol': 1e-6},
+        )
+        refined.append((res.x, -res.fun))
+    print(f'  refinement: {time.time() - t0:.1f}s')
+
+    # ── Step 4: dedup ──────────────────────────────────────────────────
+    refined.sort(key=lambda r: -r[1])
+    final = []
+    for x, L_val in refined:
+        if all(np.linalg.norm(x - x_other) >= EPSILON for x_other, _ in final):
+            final.append((x, L_val))
+
+    # ── Report ─────────────────────────────────────────────────────────
+    print(f'\n{"=" * 64}')
+    print(f' {len(final)} DISTINCT LOCAL OPTIMA  (epsilon = {EPSILON})')
+    print(f'{"=" * 64}')
+    print(f'{"#":<4} {"F1":>7} {"F2":>7} {"F3":>7} {"F4":>7} '
+          f'{"sumF":>7} {"L_final":>10}')
+    print('-' * 56)
+    for i, (x, L_val) in enumerate(final, 1):
+        print(f'{i:<4} {x[0]:>7.2f} {x[1]:>7.2f} {x[2]:>7.2f} {x[3]:>7.2f} '
+              f'{x.sum():>7.2f} {L_val:>10.4f}')
+
+    if len(final) > 1:
+        best_x, best_L = final[0]
+        print(f'\nGap from #1 (L = {best_L:.4f}):')
+        for i, (x, L_val) in enumerate(final[1:], 2):
+            gap = best_L - L_val
+            pct = 100.0 * gap / best_L if best_L > 0 else float('nan')
+            dist = np.linalg.norm(best_x - x)
+            print(f'  #{i}: -{gap:.3f} ({pct:.1f}%), distance = {dist:.1f}')
 
 
-# ── Phase 2: ε-separated peak selection ─────────────────────────────────────
-peaks = greedy_eps_separated(F_scan, L_scan, EPSILON, k_max=N_TOP)
-print(f'Phase 2 — top {len(peaks)} ε-separated peaks (eps={EPSILON})')
-
-
-# ── Phase 3: batched projected gradient ascent ──────────────────────────────
-print(f'Phase 3 — batched gradient ascent ({N_ITER} iters)')
-t0 = time.time()
-s_init = np.array([p for p, _ in peaks])
-s_opt, L_opt = batched_gradient_ascent(s_init)
-print(f'  {time.time()-t0:.1f}s, '
-      f'best pre={max(L for _, L in peaks):.3f}, '
-      f'best post={L_opt.max():.3f}')
-
-
-# ── Phase 4: dedupe + corner augmentation ───────────────────────────────────
-final = greedy_eps_separated(s_opt, L_opt, EPSILON)
-corner_L = obj.evaluate_batch(corners)
-for c, Lc in zip(corners, corner_L):
-    if all(np.linalg.norm(c - so) >= 1e-6 for so, _ in final):
-        final.append((c, float(Lc)))
-final = sorted(final, key=lambda x: -x[1])
-print(f'Phase 4 — {len(final)} candidates after dedupe')
-
-
-# ── Phase 5: gradient + Hessian + discrete-max classification ───────────────
-print(f'Phase 5 — classify (h={H_VERIFY})')
-t0 = time.time()
-classified = []
-for s, L_val in final:
-    L0, g, H, on_lo, on_hi, h_vec, L_plus, L_minus = grad_hess(s, h=H_VERIFY)
-    kind, info = classify(s, L0, g, H, on_lo, on_hi,
-                          L_plus=L_plus, L_minus=L_minus)
-    classified.append((s, L_val, kind, info, L0, g))
-print(f'  classification: {time.time()-t0:.1f}s')
-
-
-# ── Report ──────────────────────────────────────────────────────────────────
-print(f'\n{"="*108}')
-print(f' {len(classified)} CANDIDATES, classified by gradient + Hessian')
-print(f'{"="*108}')
-print(f'{"#":<4} {"F1":>7} {"F2":>7} {"F3":>7} {"F4":>7} {"Total":>7} '
-      f'{"L_final":>9} {"|g_free|":>9} {"max eig":>9}  status')
-print('-' * 108)
-for i, (s, L_val, kind, info, L0, g) in enumerate(classified, 1):
-    free = info['free']
-    g_free = np.linalg.norm(g[free]) if free.any() else 0.0
-    max_eig = info['eigvals'].max() if info['eigvals'].size > 0 else float('nan')
-    print(f'{i:<4} {s[0]:>7.2f} {s[1]:>7.2f} {s[2]:>7.2f} {s[3]:>7.2f} '
-          f'{sum(s):>7.2f} {L_val:>9.4f} {g_free:>9.4f} {max_eig:>9.4f}  '
-          f'{KIND_COLOR[kind]}')
-
-genuine  = [c for c in classified if c[2] in ('interior_max', 'boundary_max')]
-interior = [c for c in genuine if c[2] == 'interior_max']
-boundary = [c for c in genuine if c[2] == 'boundary_max']
-print(f'\nSummary: {len(genuine)} genuine local maxima '
-      f'({len(interior)} interior, {len(boundary)} boundary), '
-      f'{len(classified)-len(genuine)} discarded as saddle/not-max.')
-print(f'Total simulator evaluations: {obj.n_evals}')
-
-if len(genuine) > 1:
-    print(f'\nTop genuine maxima (gap from #1):')
-    g0 = genuine[0][1]
-    for i, (s, L_val, kind, _, _, _) in enumerate(genuine[:20], 1):
-        gap = g0 - L_val
-        pct = 100 * gap / g0 if g0 > 0 else 0
-        kind_short = 'INT ' if kind == 'interior_max' else 'BDY '
-        print(f'  #{i:<2} {kind_short} ({s[0]:>5.1f},{s[1]:>5.1f},{s[2]:>5.1f},{s[3]:>5.1f}) '
-              f'L={L_val:>7.3f}  -{gap:>5.2f} ({pct:>4.1f}%)')
+if __name__ == '__main__':
+    main()

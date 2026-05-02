@@ -1,4 +1,5 @@
 import torch
+from tqdm.auto import tqdm
 
 class Tsit5SolverTorch:
     """
@@ -52,7 +53,7 @@ class Tsit5SolverTorch:
         self.b_nz = [(i, self.b[i]) for i in range(7) if self.b[i] != 0.0]
         self.e_nz = [(i, self.e[i]) for i in range(7) if self.e[i] != 0.0]
 
-    def solve(self, fun, y0, t_span, t_eval, args=None, h0=0.1):
+    def solve(self, fun, y0, t_span, t_eval, args=None, h0=0.1, progress=True):
         """
         Solves a batch of ODEs using dense output with preallocated buffers.
 
@@ -63,6 +64,8 @@ class Tsit5SolverTorch:
             t_eval (torch.Tensor): Output time points.
             args: Additional arguments for fun.
             h0 (float): Initial step size.
+            progress (bool | str): If truthy, show a tqdm bar tracking integration
+                time. Pass a string to use it as the bar description.
 
         Returns:
             torch.Tensor: (num_samples, len(t_eval), num_vars).
@@ -73,8 +76,10 @@ class Tsit5SolverTorch:
         atol, rtol = self.atol, self.rtol
 
         t_eval = torch.as_tensor(t_eval, device=device, dtype=torch.float64)
+        t_start = float(t_span[0])
         t_end = t_eval[-1].item()
         n_eval = len(t_eval)
+        total_span = t_end - t_start
 
         # ---- Preallocate ALL buffers ----
         ks = torch.zeros((7, num_samples, num_vars), dtype=dtype, device=device)
@@ -90,7 +95,7 @@ class Tsit5SolverTorch:
 
         # ---- State ----
         y = y0.clone()
-        t = float(t_span[0])
+        t = t_start
         h = h0
 
         # Preallocate FSAL buffer (own memory, never aliases ks)
@@ -103,70 +108,92 @@ class Tsit5SolverTorch:
             results_y[:, 0, :] = y
             eval_idx = 1
 
+        pbar = None
+        if progress:
+            desc = progress if isinstance(progress, str) else "Integrating"
+            pbar = tqdm(
+                total=total_span,
+                desc=desc,
+                unit="t",
+                bar_format="{l_bar}{bar}| {n:.3f}/{total:.3f} [{elapsed}<{remaining}, {postfix}]",
+            )
+            pbar.update(t - t_start)
+
         iters = 0
-        while eval_idx < n_eval and iters < self.maxiters:
-            iters += 1
-            h_current = min(h, t_end - t)
-            if h_current < self.h_min:
-                h_current = self.h_min
+        try:
+            while eval_idx < n_eval and iters < self.maxiters:
+                iters += 1
+                h_current = min(h, t_end - t)
+                if h_current < self.h_min:
+                    h_current = self.h_min
 
-            # ---- RK stages (FSAL: ks[0] = f_current) ----
-            ks[0].copy_(f_current)
-            for j in range(1, 7):
-                Aj = A[j]
-                # dy = sum_k A[j,k] * ks[k] for k < j
-                dy.copy_(ks[0]).mul_(Aj[0])
-                for k in range(1, j):
-                    dy.add_(ks[k], alpha=Aj[k])
-                # y_stage = y + h * dy
-                torch.add(y, dy, alpha=h_current, out=y_stage)
-                ks[j] = fun(t + h_current * c[j], y_stage, args)
+                # ---- RK stages (FSAL: ks[0] = f_current) ----
+                ks[0].copy_(f_current)
+                for j in range(1, 7):
+                    Aj = A[j]
+                    # dy = sum_k A[j,k] * ks[k] for k < j
+                    dy.copy_(ks[0]).mul_(Aj[0])
+                    for k in range(1, j):
+                        dy.add_(ks[k], alpha=Aj[k])
+                    # y_stage = y + h * dy
+                    torch.add(y, dy, alpha=h_current, out=y_stage)
+                    ks[j] = fun(t + h_current * c[j], y_stage, args)
 
-            # ---- y_new = y + h * sum(b[i] * ks[i]) ----
-            i0, b0 = b_nz[0]
-            y_new.copy_(ks[i0]).mul_(b0)
-            for i, bi in b_nz[1:]:
-                y_new.add_(ks[i], alpha=bi)
-            y_new.mul_(h_current).add_(y)
+                # ---- y_new = y + h * sum(b[i] * ks[i]) ----
+                i0, b0 = b_nz[0]
+                y_new.copy_(ks[i0]).mul_(b0)
+                for i, bi in b_nz[1:]:
+                    y_new.add_(ks[i], alpha=bi)
+                y_new.mul_(h_current).add_(y)
 
-            # ---- error = h * sum(e[i] * ks[i]) ----
-            i0, e0 = e_nz[0]
-            error_estimate.copy_(ks[i0]).mul_(e0)
-            for i, ei in e_nz[1:]:
-                error_estimate.add_(ks[i], alpha=ei)
-            error_estimate.mul_(h_current)
+                # ---- error = h * sum(e[i] * ks[i]) ----
+                i0, e0 = e_nz[0]
+                error_estimate.copy_(ks[i0]).mul_(e0)
+                for i, ei in e_nz[1:]:
+                    error_estimate.add_(ks[i], alpha=ei)
+                error_estimate.mul_(h_current)
 
-            # ---- Adaptive step-size control (fused, in-place) ----
-            torch.maximum(y.abs(), y_new.abs(), out=abs_max)
-            scaled_err.copy_(abs_max).mul_(rtol).add_(atol + 1e-9)
-            torch.div(error_estimate, scaled_err, out=scaled_err)
-            scaled_err.square_()
-            err = scaled_err.sum(dim=1).max().item() ** 0.5 * inv_sqrt_nv
+                # ---- Adaptive step-size control (fused, in-place) ----
+                torch.maximum(y.abs(), y_new.abs(), out=abs_max)
+                scaled_err.copy_(abs_max).mul_(rtol).add_(atol + 1e-9)
+                torch.div(error_estimate, scaled_err, out=scaled_err)
+                scaled_err.square_()
+                err = scaled_err.sum(dim=1).max().item() ** 0.5 * inv_sqrt_nv
 
-            if err <= 1.0:  # Accept
-                t_new = t + h_current
-                y_new.clamp_(min=0.0)
+                if err <= 1.0:  # Accept
+                    t_new = t + h_current
+                    y_new.clamp_(min=0.0)
 
-                # Interpolate at t_eval points within [t, t_new]
-                # Use ks[0] for f_start (safe copy), ks[6] for f_end
-                while eval_idx < n_eval and t_eval[eval_idx].item() <= t_new + 1e-12:
-                    t_target = t_eval[eval_idx].item()
-                    theta = (t_target - t) / h_current if h_current > 1e-15 else 1.0
-                    theta = max(0.0, min(1.0, theta))
-                    _hermite_interp_out(theta, y, y_new, ks[0], ks[6],
-                                        h_current, results_y[:, eval_idx, :])
-                    results_y[:, eval_idx, :].clamp_(min=0.0)
-                    eval_idx += 1
+                    # Interpolate at t_eval points within [t, t_new]
+                    # Use ks[0] for f_start (safe copy), ks[6] for f_end
+                    while eval_idx < n_eval and t_eval[eval_idx].item() <= t_new + 1e-12:
+                        t_target = t_eval[eval_idx].item()
+                        theta = (t_target - t) / h_current if h_current > 1e-15 else 1.0
+                        theta = max(0.0, min(1.0, theta))
+                        _hermite_interp_out(theta, y, y_new, ks[0], ks[6],
+                                            h_current, results_y[:, eval_idx, :])
+                        results_y[:, eval_idx, :].clamp_(min=0.0)
+                        eval_idx += 1
 
-                t = t_new
-                y.copy_(y_new)
-                f_current.copy_(ks[6])  # FSAL: copy into own buffer
+                    if pbar is not None:
+                        pbar.update(t_new - t)
+                        pbar.set_postfix_str(
+                            f"h={h_current:.2e} err={err:.2e} acc={iters}",
+                            refresh=False,
+                        )
 
-                q = (1.0 / (err + 1e-9)) ** 0.2  # 1/(p+1) = 1/5
-                h = min(self.h_max, h_current * self.safety_factor * q)
-            else:
-                q = (1.0 / err) ** 0.2
-                h = max(self.h_min, h * self.safety_factor * q)
+                    t = t_new
+                    y.copy_(y_new)
+                    f_current.copy_(ks[6])  # FSAL: copy into own buffer
+
+                    q = (1.0 / (err + 1e-9)) ** 0.2  # 1/(p+1) = 1/5
+                    h = min(self.h_max, h_current * self.safety_factor * q)
+                else:
+                    q = (1.0 / err) ** 0.2
+                    h = max(self.h_min, h * self.safety_factor * q)
+        finally:
+            if pbar is not None:
+                pbar.close()
 
         if eval_idx < n_eval:
             raise ValueError(

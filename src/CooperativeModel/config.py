@@ -22,7 +22,7 @@ class ModelParameters:
 
     # ks reduced from 1200 -> 400 to soften the bistable nisin-protection cliff
     # so the survival/death boundary moves into the interior of the F-box.
-    # Combined with K_coop > 0 (cross-feeding requires all sugars) and CCR-on-
+    # Combined with K_coop > 0 (co-limitation requires all sugars) and CCR-on-
     # nisin (penalises high F_total), this places multiple local L_final
     # maxima at strictly-interior F* in (0, 100)^4.
 
@@ -90,13 +90,19 @@ class ModelParameters:
     K_pH:  float = 50.0
     h_pH:  float = 4.0
 
-    # Cross-feeding / Liebig minimum law for cooperative nisin production.
-    # Nisin production requires ALL 4 sugars to be present (complementary
-    # micronutrients / cofactors hypothesis):  Pm *= prod_i F_i / (K_coop + F_i).
+    # Multiplicative co-limitation factor for nisin biosynthesis.
+    # The four sugars are treated as complementary, non-substitutable inputs
+    # to a single secondary-metabolite flux:  Pm *= prod_i F_i / (K_coop + F_i).
+    # This is Saito et al. (2008) "Type I" co-limitation in the multiplicative
+    # / Mankin form (Megee 1972; Bader 1978).  It is NOT cross-feeding (which
+    # would mean metabolic exchange between strains) — it is single-cell co-
+    # limitation of nisin biosynthetic flux by complementary precursor pools.
     # K_coop = 2.0 puts a smooth Hill-shaped penalty on any sugar going to
     # zero — combined with CCR-on-nisin (penalises high F_total), this pushes
     # optima away from BOTH the lower and upper bounds of every coordinate.
-    # Setting K_coop -> 0 recovers no cross-feeding requirement.
+    # Strict Liebig minimum would be min_i F_i / (K_coop + F_i) and only track
+    # the single most-limiting sugar.  Setting K_coop -> 0 recovers the limit
+    # where every sugar is "always sufficient" so co-limitation is inactive.
     K_coop: float = 2.0
 
     # Carbon catabolite repression (CCR) of nisin biosynthesis.

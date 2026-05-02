@@ -114,9 +114,22 @@ def compute_reaction_rates(state, params):
     ccr_factor = 1.0 / (1.0 + (F_total / K_ccr).pow(h_ccr))
     # P_{S,Sn,F} = alpha * (Sn + rb) / (kp + Sn) * sum(Fi) * ccr_factor
     P_coeff = alpha * (Sn + rb) / (kp + Sn) * F_total * ccr_factor
-    # Liebig minimum law: nisin production requires ALL 4 sugars present
-    # (cross-feeding / complementary micronutrient hypothesis).  Each Hill
-    # term saturates at 1, so this caps production rather than amplifying it.
+    # Multiplicative co-limitation factor: nisin biosynthesis treats the four
+    # sugars as complementary, non-substitutable inputs to a single secondary-
+    # metabolite flux.  Justification: ribosomal synthesis of the 57-residue
+    # precursor + NisB/C dehydration/cyclisation + NisT export are ATP- and
+    # cofactor-intensive, so sustained nisin output requires balanced flux
+    # through glycolysis / TCA / amino-acid pools (Stein et al. JBC 2003).
+    # This is Saito et al. (2008) "Type I" co-limitation in the multiplicative
+    # / Mankin form (Megee 1972; Bader 1978).  NB: this is NOT cross-feeding,
+    # which would mean metabolic exchange between strains; this is single-
+    # cell co-limitation of secondary-metabolite biosynthesis.
+    # Each Hill term saturates at 1, so the product caps production rather
+    # than amplifying it; any sugar going to zero kills the whole factor.
+    # Strict Liebig would be (F / (K_coop + F)).min(dim=1) — keeping only the
+    # single most-limiting sugar.  The product form penalises all four
+    # limitations simultaneously and is what the 89 local-optima scan was
+    # carried out under.
     coop_factor = (F / (K_coop + F)).prod(dim=1, keepdim=True)   # [B, 1, H, W]
     # Pm = P_{S,Sn,F} * N1 * N2 / (km + N2) * coop_factor
     Pm = P_coeff * N1 * N2 / (km + N2) * coop_factor
