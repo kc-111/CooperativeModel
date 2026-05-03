@@ -1,52 +1,55 @@
 """Velocity field generator for 2D bioreactor stirring.
 
-Steady single-cell mean flow as the curl of a stream function — one
-centered circulation cell with no-penetration on every wall.
+Rushton-turbine vertical-slice mean flow: two stacked counter-rotating
+vortices with a radial jet at mid-height, derived from a separable
+stream function. Optional time-periodic blade-pass proxy via
+``period`` / ``t``.
 """
 
-import math
+import numpy as np
 import torch
 
+# Blade-pass proxy magnitudes — only active when ``period`` is set.
+_INTENSITY_PULSE = 0.10   # +/- envelope on amplitude A(t)
+_JET_WOBBLE      = 0.02   # +/- fraction of Ly for jet vertical wobble
 
-def bioreactor_flow(grid_cfg, U_imp=0.5, device='cpu', dtype=torch.float64):
-    """Steady single-cell mean flow as the curl of a stream function.
 
-    psi(x, y) = A sin(pi x / Lx) sin(pi y / Ly)
-        vx =  d psi/dy =  A (pi / Ly) sin(pi x / Lx) cos(pi y / Ly)
-        vy = -d psi/dx = -A (pi / Lx) cos(pi x / Lx) sin(pi y / Ly)
+def rushton_flow(y_grid, x_grid, dx, U_imp, period=None, t=0.0,
+                 device="cpu", dtype=torch.float32):
+    """2D vertical-slice Rushton-turbine velocity field [2, Y, X].
 
-    Topology: one centered circulation cell. psi = 0 on all four walls
-    so the field is divergence-free with no-penetration BCs by
-    construction. A is rescaled numerically so max |v| equals U_imp.
-
-    Args:
-        grid_cfg: GridConfig instance.
-        U_imp:    Peak mean-flow speed [cm/h] — the only stirring knob.
-                  Set to 0 for a quiescent (no-stirring) reactor.
-
-    Returns:
-        [1, 2, Ny, Nx] velocity field (channel 0 = vx, channel 1 = vy).
+    Streamfunction psi(x,y,t) = -A(t) * sin(pi x/Lx) * sin(2 pi (y-d(t))/Ly)
+    gives two stacked counter-rotating vortices with a radial jet at mid-
+    height. ``A(t)`` and ``d(t)`` are blade-pass proxies; both vanish when
+    ``period`` is None (steady field). The field is normalised so the peak
+    speed equals ``U_imp`` (independent of grid).
     """
-    Nx, Ny = grid_cfg.Nx, grid_cfg.Ny
-    Lx, Ly = grid_cfg.Lx, grid_cfg.Ly
-    dx, dy = grid_cfg.dx, grid_cfg.dy
+    Lx = x_grid * dx
+    Ly = y_grid * dx
+    ys = (torch.arange(y_grid, device=device, dtype=dtype) + 0.5) * dx
+    xs = (torch.arange(x_grid, device=device, dtype=dtype) + 0.5) * dx
+    Y, X = torch.meshgrid(ys, xs, indexing="ij")
 
-    x = torch.linspace(0.5 * dx, Lx - 0.5 * dx, Nx, device=device, dtype=dtype)
-    y = torch.linspace(0.5 * dy, Ly - 0.5 * dy, Ny, device=device, dtype=dtype)
-    Y, X = torch.meshgrid(y, x, indexing='ij')
+    if period is None or period <= 0:
+        A = 1.0
+        delta = 0.0
+    else:
+        omega_t = 2.0 * np.pi * t / period
+        A = 1.0 + _INTENSITY_PULSE * float(np.cos(omega_t))
+        delta = _JET_WOBBLE * Ly * float(np.sin(omega_t))
 
-    kx = math.pi / Lx
-    ky = math.pi / Ly
+    sx = torch.sin(np.pi * X / Lx)
+    cx = torch.cos(np.pi * X / Lx)
+    sy = torch.sin(2.0 * np.pi * (Y - delta) / Ly)
+    cy = torch.cos(2.0 * np.pi * (Y - delta) / Ly)
 
-    sin_kx = torch.sin(kx * X)
-    cos_kx = torch.cos(kx * X)
-    sin_ky = torch.sin(ky * Y)
-    cos_ky = torch.cos(ky * Y)
+    vx = -A * sx * (2.0 * np.pi / Ly) * cy
+    vy = +A * (np.pi / Lx) * cx * sy
 
-    vx = ky * sin_kx * cos_ky
-    vy = -kx * cos_kx * sin_ky
+    peak = torch.sqrt(vx * vx + vy * vy).max()
+    if peak > 1e-12:
+        scale = U_imp / peak
+        vx = vx * scale
+        vy = vy * scale
 
-    speed = torch.sqrt(vx * vx + vy * vy)
-    peak = float(speed.max())
-    A = (U_imp / peak) if peak > 0 else 0.0
-    return torch.stack([A * vx, A * vy], dim=0).unsqueeze(0)
+    return torch.stack([vx, vy], dim=0)

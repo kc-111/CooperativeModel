@@ -37,7 +37,7 @@ CANDIDATES = [
 samples = [[0.05, 0.05, 0.0, 0.0, F1 * 0.1, F2 * 0.1, F3 * 0.1, F4 * 0.1]
            for (_, F1, F2, F3, F4) in CANDIDATES]
 
-U_imp = 0.5
+U_imp = 0.25
 
 # --- PDE flow-through (open reactor with inlet/outlet) — for visualisation ---
 start = time.time()

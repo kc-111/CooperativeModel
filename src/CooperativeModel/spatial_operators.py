@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 INV_SQRT2 = 1.0 / (2.0 ** 0.5)
+_HARM_EPS = 1e-30
 
 
 class Divergence:
@@ -15,7 +16,11 @@ class Divergence:
     Compute nabla.(D nabla c) using an 8-direction flux-based finite difference stencil.
 
     4 cardinal neighbours (weight 1.0) and 4 diagonal neighbours (weight 1/sqrt2).
-    Face-averaged diffusion coefficients: D_face = (D_center + D_neighbour) / 2.
+    Face-averaged diffusion coefficients use the harmonic mean: cardinals use
+    the harmonic mean of the two adjacent cells, diagonals use the harmonic
+    mean of the four cells touching the corner. Harmonic averaging gives the
+    correct flux at sharp D discontinuities (e.g. D=0 walls produce zero face
+    flux automatically — the no-flux BC).
     Replicate padding enforces Neumann (no-flux) boundary conditions.
 
     Args:
@@ -63,7 +68,7 @@ class Divergence:
             D_pad = F.pad(D, (1, 1, 1, 1), mode='replicate')
             D_center = D_pad[:, :, 1:1+H, 1:1+W]
         else:
-            D_center = D  # broadcasts
+            D_center = D  # broadcasts; harmonic mean of equal values is the value itself
 
         inv_dx2 = 1.0 / (self.dx * self.dy)
         result = torch.zeros_like(c)
@@ -72,7 +77,18 @@ class Divergence:
             c_nbr = c_pad[:, :, 1+dr:1+dr+H, 1+dc:1+dc+W]
             if spatially_varying:
                 D_nbr = D_pad[:, :, 1+dr:1+dr+H, 1+dc:1+dc+W]
-                D_face = 0.5 * (D_center + D_nbr)
+                if dr == 0 or dc == 0:
+                    # Cardinal face: harmonic mean of the two adjacent cells.
+                    D_face = 2.0 * D_center * D_nbr / (D_center + D_nbr + _HARM_EPS)
+                else:
+                    # Diagonal face: harmonic mean of all four cells the corner touches
+                    # (center, diagonal neighbour, and the two cardinals between them).
+                    D_card_r = D_pad[:, :, 1+dr:1+dr+H, 1:1+W]
+                    D_card_c = D_pad[:, :, 1:1+H, 1+dc:1+dc+W]
+                    D_face = 4.0 / (1.0 / (D_center  + _HARM_EPS)
+                                  + 1.0 / (D_nbr     + _HARM_EPS)
+                                  + 1.0 / (D_card_r  + _HARM_EPS)
+                                  + 1.0 / (D_card_c  + _HARM_EPS))
             else:
                 D_face = D  # broadcasts
             result.add_(D_face * (c_nbr - c_center), alpha=w * inv_dx2)

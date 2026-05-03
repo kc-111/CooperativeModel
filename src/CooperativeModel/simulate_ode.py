@@ -24,7 +24,7 @@ import torch
 
 from .config import SimulationConfig, GridConfig, SolverConfig, DiffusionConfig
 from .initial_conditions import uniform, random_inoculation, stratified_inoculation
-from .velocity_fields import bioreactor_flow
+from .velocity_fields import rushton_flow
 from .model import BioreactorRHS, simulate, compute_cfl_limit
 from .tsit5_solver import Tsit5SolverTorch
 
@@ -303,7 +303,9 @@ class Simulator:
         dtype = torch.float64
 
         y0 = uniform(grid, device=self.device, dtype=dtype, **self.ic)
-        vel = (bioreactor_flow(grid, U_imp=self.U_imp, device=self.device, dtype=dtype)
+        vel = (rushton_flow(grid.Ny, grid.Nx, dx=grid.dx,
+                            U_imp=self.U_imp,
+                            device=self.device, dtype=dtype).unsqueeze(0)
                if self.U_imp != 0.0 else None)
 
         t0 = time.time()
@@ -324,8 +326,9 @@ class Simulator:
         ic_vals = self._ic  # [B, 8]
 
         U_imp = self.U_imp if self.U_imp != 0.0 else 0.5
-        vel = bioreactor_flow(grid, U_imp=U_imp,
-                              device=self.device, dtype=dtype)
+        vel = rushton_flow(grid.Ny, grid.Nx, dx=grid.dx,
+                           U_imp=U_imp,
+                           device=self.device, dtype=dtype).unsqueeze(0)
 
         # Inlet (top-left) and outlet (bottom-right) corner zones. With
         # origin='lower' visualisation, high-row = top and low-row = bottom.
