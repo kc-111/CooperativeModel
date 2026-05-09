@@ -1,9 +1,30 @@
 """Local reaction kinetics for the cooperative microbial consortium model.
 
-Implements the full ODE system from the model description:
+Base model: the Monod-growth + diauxic-shift + nisin-cooperative-production +
+nisin-protected-death structure follows
+
+    Kong, W., Meldgin, D. R., Collins, J. J., and Lu, T. (2018).
+    Designing microbial consortia with defined social interactions.
+    Nature Chemical Biology, 14(8), 821-829.
+
+Five mechanisms are added on top of the Kong et al. base so that L_final has
+*interior* optima in the four-sugar input space rather than the trivial
+corner-loaded optimum of the original (these are all opt-in via parameters
+that recover the Kong et al. limit when set to zero / infinity):
+  - Haldane substrate inhibition per sugar (Ki_inh -> infinity disables)
+  - Lactic-acid product inhibition of CoA growth (Kp_L -> infinity disables)
+  - Per-sugar saturating-Hill toxicity in death rate (c_tox = 0 disables)
+  - Carbon catabolite repression of nisin biosynthesis (K_ccr -> infinity)
+  - Multiplicative co-limitation of nisin biosynthesis on all 4 sugars
+    (K_coop = 0 recovers single-sugar saturation)
+
+Full system implemented:
   - Monod growth kinetics on 4 nutrients for both strains
   - Diauxic shift mechanism (CoA only) with sharpness parameter n
-  - Nisin-inhibited death rates
+  - Death split into microbial (nisin-protectable) + chemical (osmotic /
+    per-sugar toxic / acid-pH) components — chemical death is NOT suppressed
+    by nisin self-immunity, since NisI/NisFEG protect against bacteriocin
+    pore formation, not against generic physico-chemical stress
   - Cooperative nisin production depending on both strains and nutrients
   - Lactic acid production by CoA
   - Nutrient consumption by both strains
@@ -91,19 +112,35 @@ def compute_reaction_rates(state, params):
 
     F_total = F.sum(dim=1, keepdim=True)
 
-    # ---- Death rates: nisin protection × osmotic stress × (CoA: acid stress) ----
-    # nisin protects: 1 / (1 + ks * Sn)
-    # osmotic stress amplifies death of BOTH strains as F_total grows
-    # acid stress amplifies death of CoA only as L grows
+    # ---- Death rates: split into nisin-protectable (microbial) + chemical ----
+    # Microbial death (bacteriocin-style): nisin self-protection 1/(1+ks*Sn).
+    # Chemical death (osmotic / per-sugar toxicity / acid pH): NOT protected
+    # by nisin — these are general physico-chemical stresses on cell envelope
+    # and cytoplasm.  Without this split, once cells produce a tiny amount of
+    # nisin (Sn ~ 0.005, ks=400), nisin protection collapses the entire death
+    # term to ~0 and high-F configs simply consume all sugar with no penalty,
+    # making L_final monotone in F_total.  Splitting keeps a chemical-death
+    # floor that scales with F (and L), so high-F runs leave unconsumed sugar
+    # and the L-vs-F surface acquires interior optima.
     nisin_inhibition = 1.0 / (1.0 + ks * Sn)
-    osm_factor = 1.0 + c_osm * (F_total / K_osm).pow(h_osm)
-    pH_factor  = 1.0 + c_pH  * (L      / K_pH ).pow(h_pH)
-    # Per-sugar specific toxicity: sum of independent contributions, each peaks
-    # at its own K_tox_i.  This breaks the F_total symmetry so the optimum can
-    # land at non-uniform interior F_i values.
-    tox_factor = 1.0 + c_tox * (F / K_tox).pow(h_tox).sum(dim=1, keepdim=True)
-    It_Sn1 = dt1 * osm_factor * pH_factor * tox_factor * nisin_inhibition
-    It_Sn2 = dt2 * osm_factor               * tox_factor * nisin_inhibition
+    # Chemical-stress excess (>= 0): each piece is the "factor - 1" so a
+    # benign environment contributes 0 chemical death.
+    osm_excess = c_osm * (F_total / K_osm).pow(h_osm)
+    pH_excess  = c_pH  * (L       / K_pH ).pow(h_pH)
+    # Per-sugar specific toxicity: each sugar contributes a *saturating* Hill
+    # term (capped at 1), summed across the four sugars.  The sigmoidal Hill
+    # form (h_tox > 1) keeps toxicity near zero below K_tox_i and saturates
+    # cleanly above it, so death does not compound unboundedly when several
+    # sugars are simultaneously high.  Per-sugar K_tox_i breaks F_total
+    # symmetry so optima land at non-uniform interior F_i values.
+    F_over_Ktox = (F / K_tox).pow(h_tox)
+    tox_excess = c_tox * (F_over_Ktox / (1.0 + F_over_Ktox)).sum(
+        dim=1, keepdim=True,
+    )
+    # CoA: microbial death + chemical (osmotic + toxicity + pH/acid)
+    It_Sn1 = dt1 * (nisin_inhibition + osm_excess + tox_excess + pH_excess)
+    # CoB: microbial death + chemical (osmotic + toxicity)
+    It_Sn2 = dt2 * (nisin_inhibition + osm_excess + tox_excess)
 
     # ---- Cooperative nisin production ----
     # Carbon catabolite repression (CCR): high F_total downregulates nisin

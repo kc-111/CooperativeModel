@@ -1,15 +1,25 @@
 """Find local maxima of L_final over (F1, F2, F3, F4) in [0, 100]^4.
 
-Closed-batch ODE model: F1..F4 are the initial sugar amounts loaded at t=0;
-N1, N2 are fixed inocula; we maximise the spatially-averaged L (lactic acid)
-at t = t_final.
+Runs in the **well-mixed limit** (grid_shape=(1, 1, 1), flow_cache_path=None,
+device='cpu'): the optimisation needs hundreds–thousands of objective
+evaluations and the 32^3 PDE costs ~1 s/sample on GPU, while the 8-ODE
+well-mixed system costs ~10 ms/sample on CPU.  The well-mixed kinetics are
+the same kinetics each cell of the 3D PDE evaluates locally, so the L_final
+landscape is *conserved up to spatial-mixing dilution*: a well-mixed local
+optimum F* remains a local optimum in the 3D run with the matching octant
+IC, but the fluid-averaged L is reduced by the volume-fraction occupied by
+the IC plus losses from cells advected into empty regions and dying.
 
 Pipeline:
-    1. Batched landscape scan over many random points (cheap with grid_size=1).
+    1. Batched landscape scan (random interior + 16 corners).
     2. Greedy epsilon-separated selection of the top peaks.
-    3. scipy.optimize.minimize (L-BFGS-B with box constraints [0, 100]) from
-       each selected peak.
+    3. scipy.optimize.minimize (L-BFGS-B with box constraints [0, 100])
+       from each selected peak.
     4. Dedup refined optima by Euclidean distance.
+
+To deploy the resulting F* into the 3D PDE, plug the values into
+``examples/example.py`` (which uses ``ic_mode='octant'``); see the docstring
+there for the conservation argument.
 
 Usage:
     python examples/find_optima.py
@@ -24,14 +34,14 @@ from CooperativeModel import Simulator
 
 # ── Config ──────────────────────────────────────────────────────────────
 N1, N2, Sn, L0 = 0.05, 0.05, 0.0, 0.0
-T_FINAL = 48.0
-BOUNDS = [(0.0, 10.0)] * 4
-EPSILON = 1.0          # min Euclidean distance between distinct optima
-N_RANDOM = 30       # random points for landscape scan
-N_TOP = 30              # number of seeded peaks to refine
-DEVICE = 'cuda'         # 'cpu' if no GPU
+T_FINAL = 72.0
+BOUNDS = [(0.0, 100.0)] * 4
+EPSILON = 2.0
+N_RANDOM = 200
+N_TOP = 30
+DEVICE = 'cpu'
 SEED = 42
-U_imp = 0.5
+
 
 def eval_batch(sugars):
     """Vectorised L_final for sugars of shape [B, 4]."""
@@ -45,8 +55,8 @@ def eval_batch(sugars):
     samples[:, 4:] = sugars
     r = Simulator(
         samples=samples.tolist(),
-        mode='flow_through', t_final=T_FINAL, grid_size=32,
-        U_imp=U_imp, diffusion_scale=0.1, flow_rate=0.05,
+        t_final=T_FINAL, grid_shape=(1, 1, 1),
+        flow_cache_path=None,
         device=DEVICE,
     ).run()
     return np.atleast_1d(np.asarray(r.L_final))
@@ -73,20 +83,19 @@ def greedy_select(points, scores, epsilon, k):
 def main():
     rng = np.random.default_rng(SEED)
 
-    # ── Step 1: landscape scan (random interior + 16 corners) ──────────
-    print(f'Landscape scan: {N_RANDOM} random + 16 corner points...')
+    print(f'Landscape scan: {N_RANDOM} random + 16 corner points (well-mixed)...')
     t0 = time.time()
     random_pts = rng.uniform(0, 100, size=(N_RANDOM, 4))
     corners = np.array(list(itertools.product([0.0, 100.0], repeat=4)))
     all_pts = np.vstack([corners, random_pts])
     all_L = eval_batch(all_pts)
     print(f'  scan: {time.time() - t0:.1f}s  ({len(all_pts)} evaluations)')
+    print(f'  L range: [{all_L.min():.3f}, {all_L.max():.3f}], '
+          f'mean={all_L.mean():.3f}')
 
-    # ── Step 2: epsilon-separated seeds ────────────────────────────────
     seeds = greedy_select(all_pts, all_L, EPSILON, N_TOP)
     print(f'Selected {len(seeds)} epsilon-separated seeds (eps={EPSILON})')
 
-    # ── Step 3: L-BFGS-B refinement from each seed ─────────────────────
     print(f'Refining with scipy.optimize.minimize (L-BFGS-B)...')
     t0 = time.time()
     refined = []
@@ -100,14 +109,12 @@ def main():
         refined.append((res.x, -res.fun))
     print(f'  refinement: {time.time() - t0:.1f}s')
 
-    # ── Step 4: dedup ──────────────────────────────────────────────────
     refined.sort(key=lambda r: -r[1])
     final = []
     for x, L_val in refined:
         if all(np.linalg.norm(x - x_other) >= EPSILON for x_other, _ in final):
             final.append((x, L_val))
 
-    # ── Report ─────────────────────────────────────────────────────────
     print(f'\n{"=" * 64}')
     print(f' {len(final)} DISTINCT LOCAL OPTIMA  (epsilon = {EPSILON})')
     print(f'{"=" * 64}')

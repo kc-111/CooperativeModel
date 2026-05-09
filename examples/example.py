@@ -1,56 +1,86 @@
-"""Example: 2D PDE simulation of the cooperative bioreactor.
+"""Example: 3D fermentation batch bioreactor on a cached steady flow.
 
-Runs the 5 representative local optima from find_optima.py through both
-PDE modes:
+Runs one representative local optimum (from ``find_optima.py``) through
+the closed cylindrical reactor (no inlet, no outlet — a sealed batch
+fermentation).  The flow field is loaded from ``flow_cache.h5``
+produced once by ``scripts/solve_flow.py``; this script never re-solves
+the flow.
 
-  - mode='batch'        : closed 50x50 reactor with stirring + diffusion.
-                          Uniform IC, no inlet/outlet. The ranking of
-                          L_final closely matches the well-mixed ODE
-                          (Spearman ρ ≈ 0.9).
+Conservation argument (well-mixed -> 3D)
+----------------------------------------
+``find_optima.py`` performs the BO/optimisation in the well-mixed limit
+(grid_shape=(1, 1, 1)) where each evaluation is an 8-ODE solve.  The 3D
+PDE evaluates *the same kinetics* at every fluid cell, so the well-mixed
+optimum F* is a local optimum of the 3D objective up to two finite-size
+corrections:
 
-  - mode='flow_through' : open 50x50 reactor with stirring, diffusion,
-                          and inlet (top-left) / outlet (bottom-right)
-                          patches. Bacteria are seeded as random colonies
-                          at low local sugar; the inlet feeds at the IC
-                          F-values; the outlet drains. Steady-state L is
-                          much lower than batch (washout regime over 72h)
-                          and the ranking does NOT match ODE — this mode
-                          demonstrates 2D advection-reaction-diffusion
-                          dynamics, not equilibrium yield.
+  1. Volumetric dilution from the octant IC.  ``ic_mode='octant'`` puts
+     all cells + sugars into 1/8 of the cylinder, so the fluid-averaged
+     L_final reported by ``r.L_final`` is approximately
+     (1/8) x L_well_mixed in the perfect-mixing-after-startup limit.
+  2. Advective dieback.  Cells advected out of the active octant before
+     sugar arrives there see g1_total = 0 and microbial death dt1 = 0.39
+     (Sn = 0 outside the active octant, no nisin protection yet), so they
+     decay roughly as exp(-0.39 t) until sugar reaches them via the
+     impeller's chaotic streamlines.  Net: viable biomass at late times
+     is below the well-mixed value.
+
+The local-optimum *ranking* is preserved (the 4D landscape shape doesn't
+change), but absolute fluid-mean L is lower.  To recover well-mixed L
+values in the 3D run, switch ``ic_mode='uniform'`` (cells + sugars
+distributed everywhere from t=0) — that's the IC ``find_optima.py``
+implicitly assumes.
+
+Three GIFs are rendered with the wall boundary contoured:
+    sample0_midz.gif     — mid-z (xy) slice through the impeller plane
+    sample0_vertical.gif — mid-y vertical (xz) slice; full reactor height
+    sample0_topdown.gif  — z-aggregated fluid mean (top-down view)
 
 Usage:
-    python examples/example.py
+    python scripts/solve_flow.py --out flow_cache.h5     # once
+    python examples/find_optima.py                       # well-mixed search
+    python examples/example.py                           # 3D render
 """
 
 import sys, os, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
-import torch
+
 from CooperativeModel import Simulator
 
+
 CANDIDATES = [
-    ('#1  top INT',     58.59, 91.77, 17.22, 68.32),
-    ('#2  far INT',     92.41, 28.85,  7.77, 95.90),
-    ('#11 low-F4 INT',  87.41, 94.17, 28.40, 16.79),
-    ('#18 top BDY',     66.34, 44.16, 32.92, 99.86),
-    ('#20 F1=100 BDY', 100.00, 36.09,  6.25, 75.97),
+    # #1 well-mixed local optimum from scripts/find_optima_wellmixed.py.
+    # F3 ≈ 0 escapes per-sugar toxicity (K_tox_3 = 55 is the tightest) while
+    # F1, F2, F4 stay high enough to drive sustained growth + L production.
+    ('#1  starve-F3',   59.02, 84.94, 0.47, 85.34),
+    # ('#2  starve-F1',    5.72, 80.10, 92.78, 77.21),
+    # ('#3  low-F1 INT',   9.42, 97.56, 76.11, 78.61),
+    # ('#4  starve-F2',   43.89,  2.16, 82.63, 89.62),
+    # ('#5  low-F4 INT', 96.32, 78.20, 86.68, 11.41),
 ]
-samples = [[0.05, 0.05, 0.0, 0.0, F1 * 0.1, F2 * 0.1, F3 * 0.1, F4 * 0.1]
+samples = [[0.05, 0.05, 0.0, 0.0, F1, F2, F3, F4]
            for (_, F1, F2, F3, F4) in CANDIDATES]
 
-U_imp = 0.25
+FLOW_CACHE = 'flow_cache.h5'
+if not os.path.isfile(FLOW_CACHE):
+    raise SystemExit(
+        f"flow cache '{FLOW_CACHE}' not found. "
+        f"Run: python scripts/solve_flow.py --out {FLOW_CACHE}"
+    )
 
-# --- PDE flow-through (open reactor with inlet/outlet) — for visualisation ---
 start = time.time()
-r_flow = Simulator(
+r = Simulator(
     samples=samples,
-    mode='flow_through', t_final=48.0, grid_size=32,
-    U_imp=U_imp, diffusion_scale=0.1, flow_rate=0.05,
+    t_final=48.0, grid_shape=(32, 32, 32),
+    flow_cache_path=FLOW_CACHE,
+    ic_mode='octant', ic_octant=(1, 1, 1),
     device='cuda',
 ).run()
-print(f'\nPDE flow-through: {time.time() - start:.1f}s')
-print(f'  L_final per sample:  {r_flow.L_final}')
-print(f'  Sn_final per sample: {r_flow.Sn_final}')
+print(f'\n3D PDE on cached flow: {time.time() - start:.1f}s')
+print(f'  L_final per sample:  {r.L_final}')
+print(f'  Sn_final per sample: {r.Sn_final}')
 
-# Visualise each sample (flow-through has the more interesting 2D dynamics)
-for i in range(r_flow.n_samples):
-    r_flow.gif(f'flow_through_sample{i}.gif', sample=i)
+for i in range(r.n_samples):
+    r.gif(f'sample{i}_midz.gif',     sample=i, view='midz')
+    r.gif(f'sample{i}_vertical.gif', sample=i, view='midy')   # XZ slice
+    r.gif(f'sample{i}_topdown.gif',  sample=i, view='topdown')

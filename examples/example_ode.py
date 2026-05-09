@@ -1,9 +1,8 @@
-"""Example: Well-mixed (ODE) bioreactor — lactic acid comparison.
+"""Example: well-mixed (0D-equivalent) bioreactor — lactic acid comparison.
 
-Closed batch reactor with grid_size=1, no diffusion, no advection.
-The system reduces to 8 coupled ODEs (N1, N2, Sn, L, F1..F4) with
-F1..F4 as the initial sugar loading at t=0, consumed over t_final
-hours by the co-culture (CoA + CoB).
+Closed batch reactor with ``grid_shape=(1, 1, 1)``, no diffusion, no
+advection (``flow_cache_path=None``).  The system reduces to 8 coupled
+ODEs (N1, N2, Sn, L, F1..F4).
 
 Usage:
     python examples/example_ode.py
@@ -14,14 +13,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from CooperativeModel import Simulator
 
-# 5 representative local optima from find_optima.py (matches the set used
-# in pde_compare.py and gif_optima.py). F1..F4 are initial sugar amounts.
+
 CANDIDATES = [
-    ('#1  top INT',     58.59, 91.77, 17.22, 68.32),
-    ('#2  far INT',     92.41, 28.85,  7.77, 95.90),
-    ('#11 low-F4 INT',  87.41, 94.17, 28.40, 16.79),
-    ('#18 top BDY',     66.34, 44.16, 32.92, 99.86),
-    ('#20 F1=100 BDY', 100.00, 36.09,  6.25, 75.97),
+    # Top 5 local optima from scripts/find_optima_wellmixed.py with the
+    # split-death (microbial + chemical) kinetics.  Each near-edge config
+    # drops one sugar to escape per-sugar toxicity (K_tox_3 = 55 is the
+    # tightest, so F3 ≈ 0 wins).
+    ('#1  starve-F3',    59.02, 84.94,  0.47, 85.34),   # L ~ 61.21
+    ('#2  starve-F1',     5.72, 80.10, 92.78, 77.21),   # L ~ 60.65
+    ('#3  low-F1 INT',    9.42, 97.56, 76.11, 78.61),   # L ~ 59.90
+    ('#4  starve-F2',    43.89,  2.16, 82.63, 89.62),   # L ~ 59.45
+    ('#5  low-F4 INT',   96.32, 78.20, 86.68, 11.41),   # L ~ 57.85
 ]
 samples = [[0.05, 0.05, 0.0, 0.0, F1, F2, F3, F4]
            for (_, F1, F2, F3, F4) in CANDIDATES]
@@ -29,16 +31,15 @@ samples = [[0.05, 0.05, 0.0, 0.0, F1, F2, F3, F4]
 start_time = time.time()
 r = Simulator(
     samples=samples,
-    mode='batch', t_final=72.0, grid_size=1,
-    U_imp=0.0, diffusion_scale=0.0,
-    device='cuda'
+    t_final=72.0, grid_shape=(1, 1, 1),
+    flow_cache_path=None,
+    device='cuda',
 ).run()
 end_time = time.time()
 
 print(f'\nWall time: {end_time - start_time:.2f}s')
 print(f'Samples:  {r.n_samples}')
 
-# Final lactic acid per sample
 print(f'\n{"Sample":<18} {"L_final":>10} {"Sn_final":>10}')
 print('-' * 40)
 for i, (label, *_) in enumerate(CANDIDATES):

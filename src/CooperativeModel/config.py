@@ -1,7 +1,13 @@
-"""Configuration and parameters for the 2D bioreactor model.
+"""Configuration and parameters for the 3D bioreactor model.
 
 All kinetic parameters from Table 1 of the cooperative model description PDF.
-Grid, diffusion, and solver settings are also defined here.
+Grid and solver settings are also defined here.
+
+Note: explicit species diffusion has been removed.  Mixing in the 3D model is
+driven entirely by chaotic advection from the non-axisymmetric impeller body
+force; the first-order upwind advection contributes its own numerical
+diffusion which is sufficient to smooth steep fronts without an explicit
+sub-grid eddy-diffusivity term.
 """
 
 import torch
@@ -65,22 +71,25 @@ class ModelParameters:
 
     # Osmotic-stress death.  High total sugar increases death rate of both
     # strains via:  dt_eff = dt_j * (1 + c_osm * (F_total/K_osm)**h_osm).
-    # Mechanism is osmotic / hyperosmotic stress in lactic acid bacteria,
-    # which lyse above a few hundred g/L total carbohydrate.
     # Setting c_osm -> 0 recovers no osmotic stress.
     c_osm: float = 0.0
     K_osm: float = 220.0
     h_osm: float = 2.0
 
-    # Per-sugar specific toxicity / substrate-inhibition of survival.
-    # Different sugars have different toxicity profiles in LAB (glucose
-    # most reactive via Maillard / methylglyoxal, sucrose via osmolarity,
-    # maltose via maltose-specific transporter overload, etc.).
-    # dt_eff *= (1 + sum_i c_tox * (F_i / K_tox_i)**h_tox)
+    # Per-sugar specific toxicity (saturating Hill form):
+    #   dt_eff *= 1 + c_tox * sum_i Hill_h(F_i / K_tox_i)
+    #   Hill_h(x) = x**h_tox / (1 + x**h_tox)         # capped at 1 per sugar
+    # Each term saturates so the four sugars together contribute at most
+    # 4*c_tox to the death-rate multiplier (vs. an unbounded sum in the
+    # linear form).  h_tox > 1 makes the threshold sigmoidal — near-zero
+    # below K_tox_i, sharp rise above — which keeps moderate-F regions
+    # viable while still creating a clear "death zone" at very high F.
+    # With c_tox=0.35, h_tox=4, max tox_factor ≈ 2.4 → max It ≈ 0.94 (no
+    # nisin), within reach of g1_total ≈ 0.5 once Sn climbs above ~0.005.
     # Setting c_tox -> 0 recovers no per-sugar specific toxicity.
-    c_tox: float = 1.5
-    K_tox: list = field(default_factory=lambda: [55.0, 45.0, 35.0, 50.0])
-    h_tox: float = 1.0
+    c_tox: float = 0.4
+    K_tox: list = field(default_factory=lambda: [85.0, 75.0, 55.0, 80.0])
+    h_tox: float = 4.0
 
     # Acid (lactate)-induced death of CoA — separate from product inhibition
     # of growth.  Models pH-mediated cell death once L is high.
@@ -93,33 +102,17 @@ class ModelParameters:
     # Multiplicative co-limitation factor for nisin biosynthesis.
     # The four sugars are treated as complementary, non-substitutable inputs
     # to a single secondary-metabolite flux:  Pm *= prod_i F_i / (K_coop + F_i).
-    # This is Saito et al. (2008) "Type I" co-limitation in the multiplicative
-    # / Mankin form (Megee 1972; Bader 1978).  It is NOT cross-feeding (which
-    # would mean metabolic exchange between strains) — it is single-cell co-
-    # limitation of nisin biosynthetic flux by complementary precursor pools.
-    # K_coop = 2.0 puts a smooth Hill-shaped penalty on any sugar going to
-    # zero — combined with CCR-on-nisin (penalises high F_total), this pushes
-    # optima away from BOTH the lower and upper bounds of every coordinate.
-    # Strict Liebig minimum would be min_i F_i / (K_coop + F_i) and only track
-    # the single most-limiting sugar.  Setting K_coop -> 0 recovers the limit
-    # where every sugar is "always sufficient" so co-limitation is inactive.
     K_coop: float = 2.0
 
     # Carbon catabolite repression (CCR) of nisin biosynthesis.
-    # In LAB, CcpA-mediated catabolite repression downregulates secondary-
-    # metabolite (bacteriocin) production at high carbohydrate concentration:
     #   Pm *= 1 / (1 + (F_total / K_ccr)**h_ccr)
-    # Together with per-sugar toxicity this breaks the "more sugar -> more
-    # nisin -> more bacteria -> more L" chain, so the L_final landscape
-    # acquires multiple distinct interior optima.
-    # Setting K_ccr -> infinity recovers no repression.
     K_ccr: float = 300.0
     h_ccr: float = 2.0
 
     def to_tensors(self, device='cpu', dtype=torch.float64):
-        """Convert parameters to tensors shaped for broadcasting over [B, 4, H, W]."""
+        """Convert parameters to tensors shaped for broadcasting over [B, 4, Nz, Ny, Nx]."""
         def _t(vals):
-            return torch.tensor(vals, device=device, dtype=dtype).reshape(1, 4, 1, 1)
+            return torch.tensor(vals, device=device, dtype=dtype).reshape(1, 4, 1, 1, 1)
 
         return {
             'mu1': _t(self.mu1), 'mu2': _t(self.mu2),
@@ -141,12 +134,18 @@ class ModelParameters:
 
 @dataclass
 class GridConfig:
-    """Spatial grid configuration."""
+    """3D Cartesian grid configuration.
 
-    Nx: int = 50       # grid points in x
-    Ny: int = 50       # grid points in y
+    The cylinder axis is z; the cylinder is inscribed in the (x, y) cross-section
+    of the cube. Wall mask is built by ``velocity_fields.cylinder_mask(grid)``.
+    """
+
+    Nx: int = 32       # grid points in x
+    Ny: int = 32       # grid points in y
+    Nz: int = 32       # grid points in z (cylinder axis)
     Lx: float = 1.0    # domain size in x [cm]
     Ly: float = 1.0    # domain size in y [cm]
+    Lz: float = 1.0    # domain size in z [cm]
 
     @property
     def dx(self):
@@ -156,30 +155,9 @@ class GridConfig:
     def dy(self):
         return self.Ly / self.Ny
 
-
-@dataclass
-class DiffusionConfig:
-    """Diffusion coefficients for each species [cm^2/h].
-
-    Bacteria diffuse slowly; small molecules diffuse faster.
-    """
-
-    D_N1: float = 1e-6    # CoA (bacteria)
-    D_N2: float = 1e-6    # CoB (bacteria)
-    D_Sn: float = 5e-4    # nisin (small peptide)
-    D_L:  float = 5e-4    # lactic acid (small molecule)
-    D_F1: float = 1e-4    # glucose
-    D_F2: float = 1e-4    # fructose
-    D_F3: float = 1e-4    # sucrose
-    D_F4: float = 1e-4    # maltose
-
-    def to_tensor(self, device='cpu', dtype=torch.float64):
-        """Return [1, 8, 1, 1] tensor of diffusion coefficients."""
-        return torch.tensor(
-            [self.D_N1, self.D_N2, self.D_Sn, self.D_L,
-             self.D_F1, self.D_F2, self.D_F3, self.D_F4],
-            device=device, dtype=dtype,
-        ).reshape(1, 8, 1, 1)
+    @property
+    def dz(self):
+        return self.Lz / self.Nz
 
 
 @dataclass
@@ -187,7 +165,7 @@ class SolverConfig:
     """ODE solver settings."""
 
     t_final: float = 24.0
-    n_output: int = 49       # linspace(0, t_final, n_output) → every 0.5 h
+    n_output: int = 49       # linspace(0, t_final, n_output)
     atol: float = 1e-6
     rtol: float = 1e-6
     h0: float = 0.01
@@ -201,7 +179,6 @@ class SimulationConfig:
 
     model: ModelParameters = field(default_factory=ModelParameters)
     grid: GridConfig = field(default_factory=GridConfig)
-    diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
     solver: SolverConfig = field(default_factory=SolverConfig)
     device: str = 'cpu'
     dtype: torch.dtype = torch.float64

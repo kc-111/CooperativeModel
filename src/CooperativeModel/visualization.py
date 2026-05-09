@@ -1,36 +1,144 @@
-"""Visualization utilities for 2D bioreactor simulations.
+"""Visualisation utilities for the 3D bioreactor simulator.
 
-Provides spatial heatmaps, time-series of spatial averages, comparison plots,
-and animations of field evolution.
+The renderers operate on **mid-z slices** produced by ``SimResults``;
+inputs therefore have shape ``[1, T, 8, Ny, Nx]``.  The wall-fluid
+boundary is overlaid as a white contour from a 2-D ``mask2d``
+(1=fluid, 0=wall) so the cylinder geometry is visible in every frame.
+
+Time-series curves are pre-computed over the full 3-D fluid region by
+``SimResults._fluid_mean`` and passed in as a ``[T, 8]`` array; the
+plotting code does not redo the spatial reduction.
 """
 
-import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+
 
 CHANNEL_NAMES = [
     'N1 (CoA)', 'N2 (CoB)', 'Sn (nisin)', 'L (lactic acid)',
     'F1 (glucose)', 'F2 (fructose)', 'F3 (sucrose)', 'F4 (maltose)',
 ]
 
+# Curves are split into two auto-scaled panels because biomass/products
+# (channels 0-3) and sugars (channels 4-7) routinely differ by ~3 orders
+# of magnitude — a single shared y-axis collapses one group to a flat line.
+_LO_GROUP = (0, 1, 2, 3)   # N1, N2, Sn, L
+_HI_GROUP = (4, 5, 6, 7)   # F1, F2, F3, F4
 
-def plot_snapshot(results, t_eval, time_idx, grid_cfg=None, channels=None,
-                  figsize=None, vmin=None, vmax=None):
-    """Plot spatial heatmaps of selected channels at a given time index.
 
-    Args:
-        results: [1, T, 8, H, W] solution tensor.
-        t_eval: [T] time points.
-        time_idx: Index into t_eval.
-        grid_cfg: Optional GridConfig for axis labels.
-        channels: List of channel indices to plot (default: all 8).
-        figsize: Figure size tuple.
+def _add_mask_contour(ax, mask2d):
+    """Overlay the fluid/wall boundary as a thin white contour."""
+    if mask2d is None:
+        return
+    ax.contour(mask2d, levels=[0.5], colors='white', linewidths=0.6)
+
+
+def _setup_curve_panels(fig, gs, row_idx, ncols_total, t, curve_means,
+                        curve_channels):
+    """Lay out one or two curve panels with independent y-axis auto-scaling.
+
+    If ``curve_channels`` spans both the biomass/product group (0-3) and the
+    sugar group (4-7) the bottom strip is split into two side-by-side panels,
+    each auto-scaled to its own data.  Otherwise a single full-width panel is
+    used.
+
+    Lactic acid (channel 3) is drawn on a *twin* y-axis inside the
+    biomass+products panel — under octant initial conditions the
+    fluid-averaged L lags far behind N1, so a shared y-axis collapses it
+    to a near-flat line near zero.  The twin axis lets L use its own
+    auto-scaled range while still sharing the time axis.
 
     Returns:
-        matplotlib Figure.
+        lines:  list of (Line2D, channel_idx) — one entry per plotted channel.
+        vlines: list of axvline objects (one per panel) for the time cursor.
     """
-    data = results[0, time_idx].detach().cpu().numpy()  # [8, H, W]
+    import matplotlib.pyplot as plt  # local: keeps the helper self-contained
+
+    lo = [c for c in curve_channels if c in _LO_GROUP]
+    hi = [c for c in curve_channels if c in _HI_GROUP]
+
+    if lo and hi:
+        half = max(1, ncols_total // 2)
+        ax_lo = fig.add_subplot(gs[row_idx, :half])
+        ax_hi = fig.add_subplot(gs[row_idx, half:])
+        groups = [(ax_lo, lo, 'biomass + products'),
+                  (ax_hi, hi, 'sugars')]
+    else:
+        ax = fig.add_subplot(gs[row_idx, :])
+        groups = [(ax, list(curve_channels), None)]
+
+    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    L_CH = 3   # lactic acid channel
+    lines = []
+    vlines = []
+    for (ax, channels, label) in groups:
+        twin_ax = None
+        primary = [c for c in channels if c != L_CH]
+        secondary = [c for c in channels if c == L_CH]
+        # Only use a twin axis when L sits alongside other curves; if L is the
+        # only channel in this panel, give it the primary axis itself.
+        if secondary and primary:
+            twin_ax = ax.twinx()
+        else:
+            primary = list(channels)
+            secondary = []
+
+        for ch in primary:
+            line, = ax.plot([], [], label=CHANNEL_NAMES[ch],
+                            linewidth=2, color=colors[ch % len(colors)])
+            lines.append((line, ch))
+        for ch in secondary:
+            line, = twin_ax.plot([], [], label=CHANNEL_NAMES[ch] + ' (right)',
+                                 linewidth=2, color=colors[ch % len(colors)],
+                                 linestyle='--')
+            lines.append((line, ch))
+
+        ax.set_xlim(t[0], t[-1])
+        y_max = max(float(curve_means[:, ch].max()) for ch in primary)
+        y_min = min(float(curve_means[:, ch].min()) for ch in primary)
+        y_min = min(y_min, 0.0)
+        pad = 0.1 * max(y_max - y_min, 1e-12)
+        ax.set_ylim(y_min, y_max + pad if y_max > 0 else 0.1)
+        ax.set_xlabel('Time [h]')
+        ax.set_ylabel('Fluid average')
+        if label is not None:
+            ax.set_title(label, fontsize=10)
+        ax.grid(True, alpha=0.3)
+        vline = ax.axvline(t[0], color='k', linestyle='--',
+                           alpha=0.5, linewidth=1)
+        vlines.append(vline)
+
+        if twin_ax is not None:
+            l_max = max(float(curve_means[:, ch].max()) for ch in secondary)
+            l_min = min(float(curve_means[:, ch].min()) for ch in secondary)
+            l_min = min(l_min, 0.0)
+            l_pad = 0.1 * max(l_max - l_min, 1e-12)
+            twin_ax.set_ylim(l_min, l_max + l_pad if l_max > 0 else 0.1)
+            twin_ax.set_ylabel('L (right axis)')
+            # Combine legends from both axes onto the primary axis.
+            h1, lbl1 = ax.get_legend_handles_labels()
+            h2, lbl2 = twin_ax.get_legend_handles_labels()
+            ax.legend(h1 + h2, lbl1 + lbl2, fontsize=8, loc='best')
+        else:
+            ax.legend(fontsize=8, loc='best')
+    return lines, vlines
+
+
+def plot_snapshot(slice_results, t_eval, time_idx, grid_cfg=None,
+                  mask2d=None, channels=None, figsize=None,
+                  vmin=None, vmax=None):
+    """Plot mid-z-slice heatmaps of selected channels at a given time.
+
+    Args:
+        slice_results: ``[1, T, 8, Ny, Nx]`` mid-z slice of the result.
+        t_eval: ``[T]`` time points.
+        time_idx: index into t_eval.
+        grid_cfg: optional ``GridConfig`` for axis labels.
+        mask2d: optional 2-D fluid mask to draw as a contour.
+        channels: list of channel indices to plot (default: all 8).
+    """
+    data = slice_results[0, time_idx].detach().cpu().numpy()  # [8, Ny, Nx]
     t = t_eval[time_idx].item()
 
     if channels is None:
@@ -47,6 +155,7 @@ def plot_snapshot(results, t_eval, time_idx, grid_cfg=None, channels=None,
         ax = axes[idx // ncols, idx % ncols]
         im = ax.imshow(data[ch], origin='lower', aspect='equal',
                        vmin=vmin, vmax=vmax, cmap='viridis')
+        _add_mask_contour(ax, mask2d)
         ax.set_title(f'{CHANNEL_NAMES[ch]}\nt = {t:.1f} h', fontsize=10)
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         if grid_cfg:
@@ -60,20 +169,18 @@ def plot_snapshot(results, t_eval, time_idx, grid_cfg=None, channels=None,
     return fig
 
 
-def plot_spatial_average(results, t_eval, channels=None, figsize=(10, 6)):
-    """Plot spatially-averaged concentrations over time.
+def plot_spatial_average(means, t_eval, channels=None, figsize=(10, 6)):
+    """Plot fluid-averaged concentrations over time.
 
     Args:
-        results: [1, T, 8, H, W] solution tensor.
-        t_eval: [T] time points.
-        channels: List of channel indices (default: all 8).
-
-    Returns:
-        matplotlib Figure.
+        means: ``[T, 8]`` fluid-averaged time series (numpy or tensor).
+        t_eval: ``[T]`` time points.
+        channels: list of channel indices (default: all 8).
     """
-    data = results[0].detach().cpu().numpy()  # [T, 8, H, W]
-    t = t_eval.detach().cpu().numpy()
-    means = data.mean(axis=(-2, -1))  # [T, 8]
+    if hasattr(means, 'detach'):
+        means = means.detach().cpu().numpy()
+    means = np.asarray(means)
+    t = t_eval.detach().cpu().numpy() if hasattr(t_eval, 'detach') else np.asarray(t_eval)
 
     if channels is None:
         channels = list(range(8))
@@ -84,276 +191,100 @@ def plot_spatial_average(results, t_eval, channels=None, figsize=(10, 6)):
 
     ax.set_xlabel('Time [h]')
     ax.set_ylabel('Concentration')
-    ax.set_title('Spatially-averaged concentrations')
+    ax.set_title('Fluid-averaged concentrations')
     ax.legend(loc='best', fontsize=8)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     return fig
 
 
-def plot_comparison(results_2d, t_eval_2d, results_ode=None, t_eval_ode=None,
-                    channels=None, figsize=(14, 7)):
-    """Compare 2D spatial average with well-mixed ODE solution.
+def animate_all_fields_with_curves(slice_results, t_eval, channels=None,
+                                   curve_channels=None, mask2d=None,
+                                   curve_means=None, interval=150,
+                                   figsize=None, title_prefix=None,
+                                   save_path=None):
+    """Animate mid-z-slice heatmaps with fluid-averaged curves below.
 
     Args:
-        results_2d: [1, T, 8, H, W] tensor from 2D simulation.
-        t_eval_2d: [T] time points for 2D.
-        results_ode: Optional [1, T_ode, 8] tensor from ODE.
-        t_eval_ode: Optional [T_ode] time points for ODE.
-        channels: List of channel indices (default: all 8).
-
-    Returns:
-        matplotlib Figure.
-    """
-    data_2d = results_2d[0].detach().cpu().numpy()
-    t_2d = t_eval_2d.detach().cpu().numpy()
-    means_2d = data_2d.mean(axis=(-2, -1))  # [T, 8]
-
-    if channels is None:
-        channels = list(range(8))
-
-    ncols = min(4, len(channels))
-    nrows = (len(channels) + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
-
-    for idx, ch in enumerate(channels):
-        ax = axes[idx // ncols, idx % ncols]
-        ax.plot(t_2d, means_2d[:, ch], 'b-', linewidth=2, label='2D (spatial avg)')
-        if results_ode is not None and t_eval_ode is not None:
-            ode_data = results_ode[0].detach().cpu().numpy()
-            t_ode = t_eval_ode.detach().cpu().numpy()
-            ax.plot(t_ode, ode_data[:, ch], 'r--', linewidth=2, label='ODE (well-mixed)')
-        ax.set_title(CHANNEL_NAMES[ch], fontsize=10)
-        ax.set_xlabel('Time [h]')
-        ax.legend(fontsize=7)
-        ax.grid(True, alpha=0.3)
-
-    for idx in range(len(channels), nrows * ncols):
-        axes[idx // ncols, idx % ncols].set_visible(False)
-
-    plt.suptitle('2D vs Well-Mixed Comparison', fontsize=13)
-    plt.tight_layout()
-    return fig
-
-
-def animate_field(results, t_eval, channel=0, interval=100, figsize=(6, 5),
-                  save_path=None):
-    """Create an animation of a single channel over time.
-
-    Args:
-        results: [1, T, 8, H, W] solution tensor.
-        t_eval: [T] time points.
-        channel: Channel index to animate.
-        interval: Milliseconds between frames.
-        save_path: Optional path to save (.gif or .mp4).
-
-    Returns:
-        matplotlib FuncAnimation object.
-    """
-    data = results[0, :, channel].detach().cpu().numpy()  # [T, H, W]
-    t = t_eval.detach().cpu().numpy()
-    vmin, vmax = data.min(), data.max()
-
-    fig, ax = plt.subplots(figsize=figsize)
-    im = ax.imshow(data[0], origin='lower', aspect='equal',
-                   vmin=vmin, vmax=vmax, cmap='viridis')
-    title = ax.set_title(f'{CHANNEL_NAMES[channel]}  t = {t[0]:.1f} h')
-    plt.colorbar(im, ax=ax)
-
-    def update(frame):
-        im.set_data(data[frame])
-        title.set_text(f'{CHANNEL_NAMES[channel]}  t = {t[frame]:.1f} h')
-        return [im, title]
-
-    anim = animation.FuncAnimation(fig, update, frames=len(t),
-                                   interval=interval, blit=False)
-    if save_path:
-        if save_path.endswith('.gif'):
-            anim.save(save_path, writer='pillow')
-        else:
-            anim.save(save_path, writer='ffmpeg')
-
-    return anim
-
-
-def animate_all_fields(results, t_eval, channels=None, interval=150,
-                       figsize=None, save_path=None):
-    """Create a multi-panel animation of several channels over time.
-
-    Args:
-        results: [1, T, 8, H, W] solution tensor.
-        t_eval: [T] time points.
-        channels: List of channel indices (default: all 8).
-        interval: Milliseconds between frames.
-        figsize: Figure size tuple.
-        save_path: Optional path to save (.gif or .mp4).
-
-    Returns:
-        matplotlib FuncAnimation object.
-    """
-    if channels is None:
-        channels = list(range(8))
-    nc = len(channels)
-    ncols = min(4, nc)
-    nrows = (nc + ncols - 1) // ncols
-
-    data = results[0].detach().cpu().numpy()  # [T, 8, H, W]
-    t = t_eval.detach().cpu().numpy()
-
-    if figsize is None:
-        figsize = (4 * ncols, 3.5 * nrows)
-
-    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
-
-    ims = []
-    for idx, ch in enumerate(channels):
-        ax = axes[idx // ncols, idx % ncols]
-        vmin, vmax = data[:, ch].min(), data[:, ch].max()
-        im = ax.imshow(data[0, ch], origin='lower', aspect='equal',
-                       vmin=vmin, vmax=vmax, cmap='viridis')
-        ax.set_title(CHANNEL_NAMES[ch], fontsize=9)
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        ims.append((im, ch))
-
-    for idx in range(nc, nrows * ncols):
-        axes[idx // ncols, idx % ncols].set_visible(False)
-
-    suptitle = fig.suptitle(f't = {t[0]:.1f} h', fontsize=13)
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-
-    def update(frame):
-        for im, ch in ims:
-            im.set_data(data[frame, ch])
-        suptitle.set_text(f't = {t[frame]:.1f} h')
-        return [im for im, _ in ims] + [suptitle]
-
-    anim = animation.FuncAnimation(fig, update, frames=len(t),
-                                   interval=interval, blit=False)
-    if save_path:
-        if save_path.endswith('.gif'):
-            anim.save(save_path, writer='pillow', dpi=100)
-        else:
-            anim.save(save_path, writer='ffmpeg', dpi=100)
-
-    return anim
-
-
-def animate_all_fields_with_curves(results, t_eval, channels=None,
-                                   curve_channels=None, zone_boxes=None,
-                                   interval=150, figsize=None, save_path=None):
-    """Animate spatial heatmaps with spatially-averaged time series below.
-
-    Top rows show the spatial fields.  The bottom row shows a progressively
-    revealed time-series of selected channels so you can watch the system
-    approach (or fail to reach) steady state.
-
-    Args:
-        results: [1, T, 8, H, W] solution tensor.
-        t_eval: [T] time points.
-        channels: Channels to show as heatmaps (default: all 8).
-        curve_channels: Channels to plot as time series (default: [2, 3] = Sn, L).
-        zone_boxes: Optional list of dicts to draw labeled rectangles on
-            every heatmap.  Each dict has keys:
-                'xy': (col, row) lower-left corner in array coords,
-                'width': box width in cells,
-                'height': box height in cells,
-                'color': edge color (default 'red'),
-                'label': text label (default '').
-        interval: Milliseconds between frames.
-        figsize: Figure size tuple.
-        save_path: Optional path to save (.gif or .mp4).
-
-    Returns:
-        matplotlib FuncAnimation object.
+        slice_results: ``[1, T, 8, Ny, Nx]`` mid-z slice tensor.
+        t_eval: ``[T]`` time points.
+        channels: heatmap channels (default: all 8).
+        curve_channels: channels to plot as time series (default: [2, 3]).
+        mask2d: 2-D fluid mask drawn as a contour overlay on every panel.
+        curve_means: ``[T, 8]`` fluid-averaged time series to plot.  If
+            ``None``, the mean is computed over the 2-D slice (suitable
+            for the well-mixed limit where slice == volume).
+        interval: ms between frames.
+        save_path: ``.gif`` or ``.mp4`` to save (optional).
     """
     if channels is None:
         channels = list(range(8))
     if curve_channels is None:
-        curve_channels = [2, 3]  # Sn and L
+        curve_channels = list(range(8))  # all variables
 
     nc = len(channels)
     ncols = min(4, nc)
     nrows_maps = (nc + ncols - 1) // ncols
 
-    data = results[0].detach().cpu().numpy()  # [T, 8, H, W]
-    t = t_eval.detach().cpu().numpy()
-    means = data.mean(axis=(-2, -1))  # [T, 8]
+    data = slice_results[0].detach().cpu().numpy()  # [T, 8, Ny, Nx]
+    t = t_eval.detach().cpu().numpy() if hasattr(t_eval, 'detach') else np.asarray(t_eval)
+
+    if curve_means is None:
+        curve_means = data.mean(axis=(-2, -1))  # [T, 8]
+    else:
+        curve_means = np.asarray(curve_means)
 
     if figsize is None:
         figsize = (4 * ncols, 3.5 * nrows_maps + 3)
 
-    # Layout: heatmap rows + one time-series row
     fig = plt.figure(figsize=figsize)
     gs = fig.add_gridspec(nrows_maps + 1, ncols,
-                          height_ratios=[1] * nrows_maps + [0.8],
-                          hspace=0.4)
+                          height_ratios=[1] * nrows_maps + [1.0],
+                          hspace=0.45, wspace=0.35)
 
-    # --- Heatmap axes ---
+    # Per-frame normalisation: each frame's vmax = that frame's slice max.
+    # Concentrations sweep orders of magnitude as the reaction-advection-
+    # diffusion system evolves; a global vmax washes out spatial structure.
+    # Re-scaling per frame preserves the *pattern* of mixing in each frame.
     ims = []
     hm_axes = []
     for idx, ch in enumerate(channels):
         ax = fig.add_subplot(gs[idx // ncols, idx % ncols])
         hm_axes.append(ax)
-        vmin, vmax = data[:, ch].min(), data[:, ch].max()
+        vmax0 = max(float(np.nanmax(data[0, ch])), 1e-12)
         im = ax.imshow(data[0, ch], origin='lower', aspect='equal',
-                       vmin=vmin, vmax=vmax, cmap='viridis')
+                       vmin=0, vmax=vmax0, cmap='viridis')
+        _add_mask_contour(ax, mask2d)
         ax.set_title(CHANNEL_NAMES[ch], fontsize=9)
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         ims.append((im, ch))
-
-    # --- Draw zone boxes on every heatmap ---
-    if zone_boxes:
-        from matplotlib.patches import Rectangle
-        for ax in hm_axes:
-            for box in zone_boxes:
-                xy = box['xy']
-                w, h = box['width'], box['height']
-                color = box.get('color', 'red')
-                rect = Rectangle(
-                    (xy[0] - 0.5, xy[1] - 0.5), w, h,
-                    linewidth=2, edgecolor=color, facecolor='none',
-                )
-                ax.add_patch(rect)
-                label = box.get('label', '')
-                if label:
-                    ax.text(
-                        xy[0] + w / 2, xy[1] + h / 2, label,
-                        color=color, fontsize=7, fontweight='bold',
-                        ha='center', va='center',
-                    )
 
     for idx in range(nc, nrows_maps * ncols):
         ax = fig.add_subplot(gs[idx // ncols, idx % ncols])
         ax.set_visible(False)
 
-    # --- Time-series axis (full width) ---
-    ax_ts = fig.add_subplot(gs[nrows_maps, :])
-    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-    lines = []
-    for i, ch in enumerate(curve_channels):
-        line, = ax_ts.plot([], [], label=CHANNEL_NAMES[ch],
-                           linewidth=2, color=colors[i % len(colors)])
-        lines.append((line, ch))
-    ax_ts.set_xlim(t[0], t[-1])
-    y_max = max(means[:, ch].max() for ch in curve_channels) * 1.1
-    y_min = 0
-    ax_ts.set_ylim(y_min, max(y_max, 0.1))
-    ax_ts.set_xlabel('Time [h]')
-    ax_ts.set_ylabel('Spatial average')
-    ax_ts.legend(fontsize=9, loc='upper left')
-    ax_ts.grid(True, alpha=0.3)
-    vline = ax_ts.axvline(t[0], color='k', linestyle='--', alpha=0.5, linewidth=1)
+    lines, vlines = _setup_curve_panels(
+        fig, gs, nrows_maps, ncols, t, curve_means, curve_channels,
+    )
 
-    suptitle = fig.suptitle(f't = {t[0]:.1f} h', fontsize=13, y=0.98)
+    title_text = (lambda fr: f't = {t[fr]:.1f} h' if not title_prefix
+                  else f'{title_prefix}   t = {t[fr]:.1f} h')
+    suptitle = fig.suptitle(title_text(0), fontsize=13, y=0.98)
 
     def update(frame):
         for im, ch in ims:
-            im.set_data(data[frame, ch])
+            frame_data = data[frame, ch]
+            im.set_data(frame_data)
+            vmax_f = max(float(np.nanmax(frame_data)), 1e-12)
+            im.set_clim(vmin=0, vmax=vmax_f)
         for line, ch in lines:
-            line.set_data(t[:frame + 1], means[:frame + 1, ch])
-        vline.set_xdata([t[frame], t[frame]])
-        suptitle.set_text(f't = {t[frame]:.1f} h')
-        return [im for im, _ in ims] + [line for line, _ in lines] + [vline, suptitle]
+            line.set_data(t[:frame + 1], curve_means[:frame + 1, ch])
+        for vline in vlines:
+            vline.set_xdata([t[frame], t[frame]])
+        suptitle.set_text(title_text(frame))
+        return ([im for im, _ in ims]
+                + [line for line, _ in lines]
+                + list(vlines) + [suptitle])
 
     anim = animation.FuncAnimation(fig, update, frames=len(t),
                                    interval=interval, blit=False)
@@ -363,4 +294,101 @@ def animate_all_fields_with_curves(results, t_eval, channels=None,
         else:
             anim.save(save_path, writer='ffmpeg', dpi=100)
 
+    return anim
+
+
+def animate_orthoviews(slices, masks, t_eval, channels=None,
+                       curve_channels=None, curve_means=None,
+                       interval=150, figsize=None, save_path=None):
+    """Animate three orthogonal slices (mid-z, mid-y, mid-x) per channel.
+
+    Args:
+        slices: tuple ``(slz, sly, slx)`` of three ``[1, T, 8, H, W]``
+            mid-plane tensors (z-, y-, x-perpendicular planes).
+        masks: tuple ``(mz, my, mx)`` of 2-D fluid masks for each plane,
+            used as white-contour overlays.
+        t_eval: ``[T]`` time points.
+        channels: heatmap channels (default: all 8).
+        curve_channels: channels to plot as time series (default: [2, 3]).
+        curve_means: ``[T, 8]`` fluid-averaged time series.
+        interval: ms between frames.
+        save_path: ``.gif`` or ``.mp4`` (optional).
+
+    Layout: 8 rows (one per channel) by 3 columns (z, y, x slices), with
+    a fluid-averaged time-series strip below.
+    """
+    if channels is None:
+        channels = list(range(8))
+    if curve_channels is None:
+        curve_channels = list(range(8))
+
+    slz, sly, slx = slices
+    mz, my, mx = masks
+    plane_data = [
+        (slz[0].detach().cpu().numpy(), mz, 'mid-z (xy)'),  # [T, 8, Ny, Nx]
+        (sly[0].detach().cpu().numpy(), my, 'mid-y (xz)'),  # [T, 8, Nz, Nx]
+        (slx[0].detach().cpu().numpy(), mx, 'mid-x (yz)'),  # [T, 8, Nz, Ny]
+    ]
+    t = t_eval.detach().cpu().numpy() if hasattr(t_eval, 'detach') else np.asarray(t_eval)
+
+    if curve_means is None:
+        curve_means = plane_data[0][0].mean(axis=(-2, -1))
+    curve_means = np.asarray(curve_means)
+
+    nrows = len(channels)
+    if figsize is None:
+        figsize = (12, 1.6 * nrows + 3)
+
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(nrows + 1, 3,
+                          height_ratios=[1] * nrows + [0.9 * max(nrows / 4, 1)],
+                          hspace=0.5, wspace=0.3)
+
+    ims = []  # list of (im, channel_idx, plane_idx)
+    for r, ch in enumerate(channels):
+        for c, (data_p, mask_p, plane_label) in enumerate(plane_data):
+            ax = fig.add_subplot(gs[r, c])
+            vmax0 = max(float(np.nanmax(data_p[0, ch])), 1e-12)
+            im = ax.imshow(data_p[0, ch], origin='lower', aspect='equal',
+                           vmin=0, vmax=vmax0, cmap='viridis')
+            _add_mask_contour(ax, mask_p)
+            if r == 0:
+                ax.set_title(plane_label, fontsize=10)
+            if c == 0:
+                ax.set_ylabel(CHANNEL_NAMES[ch], fontsize=8)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            ims.append((im, ch, c))
+
+    lines, vlines = _setup_curve_panels(
+        fig, gs, nrows, 3, t, curve_means, curve_channels,
+    )
+
+    suptitle = fig.suptitle(f'orthogonal slices   t = {t[0]:.1f} h',
+                            fontsize=13, y=0.995)
+
+    def update(frame):
+        for im, ch, c in ims:
+            data_p, _, _ = plane_data[c]
+            frame_data = data_p[frame, ch]
+            im.set_data(frame_data)
+            vmax_f = max(float(np.nanmax(frame_data)), 1e-12)
+            im.set_clim(vmin=0, vmax=vmax_f)
+        for line, ch in lines:
+            line.set_data(t[:frame + 1], curve_means[:frame + 1, ch])
+        for vline in vlines:
+            vline.set_xdata([t[frame], t[frame]])
+        suptitle.set_text(f'orthogonal slices   t = {t[frame]:.1f} h')
+        return ([im for im, _, _ in ims]
+                + [line for line, _ in lines]
+                + list(vlines) + [suptitle])
+
+    anim = animation.FuncAnimation(fig, update, frames=len(t),
+                                   interval=interval, blit=False)
+    if save_path:
+        if save_path.endswith('.gif'):
+            anim.save(save_path, writer='pillow', dpi=100)
+        else:
+            anim.save(save_path, writer='ffmpeg', dpi=100)
     return anim

@@ -1,338 +1,133 @@
-"""Initial condition generators for the 2D bioreactor model.
+"""Initial-condition generators for the 3D bioreactor model.
 
-All functions return a [B, 8, Ny, Nx] tensor with channel ordering:
-    [N1, N2, Sn, L, F1, F2, F3, F4]
+Channel ordering: ``[N1, N2, Sn, L, F1, F2, F3, F4]``.
 
-When all parameters are scalars, B=1 (single sample).  Parameters can also
-be 1-D sequences or tensors of length B for multi-sample simulations.
+Two generators:
+
+  * ``uniform``  — fills every fluid cell with the per-channel value.  The
+    well-mixed limit (1 x 1 x 1) and the BO objective both use this path.
+  * ``octant``   — fills only one octant of the vessel with the per-channel
+    value, leaving the other 7/8 at zero.  The chaotic flow then has to
+    redistribute species across the cylinder, producing visually obvious
+    mixing in the GIFs while leaving ``uniform`` as the default for BO.
+
+The 2D-specific generators (Gaussian blobs, stratified halves, edge
+concentration, random/stratified colony inoculations) lived only inside
+the deprecated ``flow_through`` mode and were removed during the 3D
+migration.
 """
 
 import torch
 
 
 def _infer_batch_size(values):
-    """Return B from a list of scalar-or-array values, checking consistency."""
+    """Infer batch size from a list of scalar-or-array values, raising on
+    inconsistent lengths."""
     B = 1
     for v in values:
-        if not isinstance(v, (int, float)):
-            n = len(v) if not isinstance(v, torch.Tensor) else v.numel()
-            if n <= 1:
-                continue
-            if B == 1:
-                B = n
-            elif n != B:
-                raise ValueError(
-                    f"Array IC parameters must all have the same length; "
-                    f"got {B} and {n}")
+        if isinstance(v, (int, float)):
+            continue
+        n = len(v) if not isinstance(v, torch.Tensor) else v.numel()
+        if n <= 1:
+            continue
+        if B == 1:
+            B = n
+        elif n != B:
+            raise ValueError(
+                f'Array IC parameters must all have the same length; '
+                f'got {B} and {n}'
+            )
     return B
 
 
 def uniform(grid_cfg, N1=0.05, N2=0.05, Sn=0.0, L=0.0,
             F1=25.0, F2=25.0, F3=25.0, F4=25.0,
-            device='cpu', dtype=torch.float64):
-    """Spatially uniform initial conditions (well-mixed).
+            mask=None, device='cpu', dtype=torch.float64):
+    """Spatially-uniform initial condition, ``[B, 8, Nz, Ny, Nx]``.
 
-    Each parameter can be a scalar (single sample) or a 1-D sequence/tensor
-    of length B (multiple samples).  Returns [B, 8, Ny, Nx].
+    Each value can be a scalar (single sample) or a 1-D sequence/tensor of
+    length B.  The well-mixed limit (1 x 1 x 1) and the full 3D vessel use
+    the same path.
+
+    Args:
+        grid_cfg: ``GridConfig`` instance.
+        N1, N2, Sn, L, F1..F4: per-channel concentrations.
+        mask: optional fluid mask, ``[Nz, Ny, Nx]`` or
+            ``[1, 1, Nz, Ny, Nx]`` (1 = fluid, 0 = wall).  When given, wall
+            cells are zeroed in the returned IC.
+        device, dtype: torch placement.
     """
-    Ny, Nx = grid_cfg.Ny, grid_cfg.Nx
+    Nz, Ny, Nx = grid_cfg.Nz, grid_cfg.Ny, grid_cfg.Nx
     values = [N1, N2, Sn, L, F1, F2, F3, F4]
     B = _infer_batch_size(values)
 
-    state = torch.zeros(B, 8, Ny, Nx, device=device, dtype=dtype)
+    state = torch.zeros(B, 8, Nz, Ny, Nx, device=device, dtype=dtype)
     for i, v in enumerate(values):
         v_t = torch.as_tensor(v).to(device=device, dtype=dtype).flatten()
         if v_t.numel() == 1:
             state[:, i] = v_t.item()
         else:
-            state[:, i] = v_t.reshape(B, 1, 1)
+            state[:, i] = v_t.reshape(B, 1, 1, 1)
+
+    if mask is not None:
+        m = mask.to(device=device, dtype=dtype)
+        if m.dim() == 3:
+            m = m.reshape(1, 1, Nz, Ny, Nx)
+        state = state * m
     return state
 
 
-def gaussian_blob(grid_cfg, centers, sigmas, backgrounds,
-                  device='cpu', dtype=torch.float64):
-    """Gaussian blob initial conditions.
+def octant(grid_cfg, N1=0.05, N2=0.05, Sn=0.0, L=0.0,
+           F1=25.0, F2=25.0, F3=25.0, F4=25.0,
+           octant=(1, 1, 1),
+           mask=None, device='cpu', dtype=torch.float64):
+    """Initial condition concentrated in a single octant of the vessel.
 
-    Each specified channel gets a Gaussian peak added on top of its
-    background value.
+    Each species takes its given value inside the chosen octant (cells where
+    ``(sx*(x-Lx/2), sy*(y-Ly/2), sz*(z-Lz/2)) >= 0`` for ``octant=(sx,sy,sz)``)
+    and zero elsewhere.  Wall cells are zeroed by ``mask`` as in ``uniform``.
+
+    With chaotic advection from the non-axisymmetric impeller, this IC
+    redistributes itself across the full cylinder over many turnovers, so the
+    rendered GIFs show actual mixing rather than a constant field.
 
     Args:
-        grid_cfg: GridConfig instance.
-        centers: dict mapping channel index to (cy, cx) centre in physical coords [cm].
-        sigmas: dict mapping channel index to sigma (spread) [cm].
-        backgrounds: list of 8 background values for each channel.
+        grid_cfg: ``GridConfig`` instance.
+        N1, N2, Sn, L, F1..F4: per-channel concentrations inside the octant.
+        octant: 3-tuple of +-1 selecting (x_sign, y_sign, z_sign) relative to
+            the vessel centre ``(Lx/2, Ly/2, Lz/2)``.  Default ``(+1, +1, +1)``
+            (front-right-top).
+        mask: optional fluid mask, ``[Nz, Ny, Nx]`` or ``[1, 1, Nz, Ny, Nx]``.
+        device, dtype: torch placement.
     """
-    Ny, Nx = grid_cfg.Ny, grid_cfg.Nx
-    dx, dy = grid_cfg.dx, grid_cfg.dy
-
-    x = torch.linspace(0.5 * dx, grid_cfg.Lx - 0.5 * dx, Nx, device=device, dtype=dtype)
-    y = torch.linspace(0.5 * dy, grid_cfg.Ly - 0.5 * dy, Ny, device=device, dtype=dtype)
-    Y, X = torch.meshgrid(y, x, indexing='ij')
-
-    state = torch.zeros(1, 8, Ny, Nx, device=device, dtype=dtype)
-    for i in range(8):
-        state[:, i] = backgrounds[i]
-
-    for ch, (cy, cx) in centers.items():
-        s = sigmas.get(ch, 0.1)
-        peak = max(backgrounds[ch], 1e-3) * 5.0  # 5x background at centre
-        blob = peak * torch.exp(-((X - cx)**2 + (Y - cy)**2) / (2 * s**2))
-        state[:, ch] += blob
-
-    return state
-
-
-def stratified(grid_cfg, N1=0.05, N2=0.05, Sn=0.0, L=0.0, FT=100.0,
-               device='cpu', dtype=torch.float64):
-    """Stratified: bacteria on the left half, nutrients on the right half.
-
-    Nutrients are split equally among F1-F4 and concentrated in the right half.
-    Bacteria are concentrated in the left half. This creates a situation where
-    diffusion (and advection) must transport nutrients to bacteria.
-    """
-    Ny, Nx = grid_cfg.Ny, grid_cfg.Nx
-    mid = Nx // 2
-
-    state = torch.zeros(1, 8, Ny, Nx, device=device, dtype=dtype)
-
-    # Bacteria on left half (doubled to preserve spatial average)
-    state[:, 0, :, :mid] = N1 * 2
-    state[:, 1, :, :mid] = N2 * 2
-
-    # Nisin and lactic acid uniform
-    state[:, 2] = Sn
-    state[:, 3] = L
-
-    # Nutrients on right half (doubled to preserve spatial average)
-    F_per = FT / 4.0
-    for i in range(4, 8):
-        state[:, i, :, mid:] = F_per * 2
-
-    return state
-
-
-def random_perturbation(grid_cfg, means=None, std_frac=0.05,
-                        device='cpu', dtype=torch.float64):
-    """Small random perturbations around a mean value.
-
-    Useful for studying spontaneous pattern formation or symmetry breaking.
-
-    Args:
-        means: list of 8 mean values.
-               Default: [0.05, 0.05, 0.0, 0.0, 25.0, 25.0, 25.0, 25.0].
-        std_frac: standard deviation as a fraction of the mean.
-    """
-    if means is None:
-        means = [0.05, 0.05, 0.0, 0.0, 25.0, 25.0, 25.0, 25.0]
-
-    Ny, Nx = grid_cfg.Ny, grid_cfg.Nx
-    state = torch.zeros(1, 8, Ny, Nx, device=device, dtype=dtype)
-
-    for i, m in enumerate(means):
-        if m > 0:
-            noise = torch.randn(Ny, Nx, device=device, dtype=dtype) * (m * std_frac)
-            state[:, i] = (m + noise).clamp(min=0.0)
-        else:
-            state[:, i] = 0.0
-
-    return state
-
-
-def edge_concentrated(grid_cfg, edge='left', decay_length=0.15, noise_frac=0.05,
-                      N1=0.05, N2=0.05, Sn=0.0, L=0.0,
-                      F1=25.0, F2=25.0, F3=25.0, F4=25.0,
-                      device='cpu', dtype=torch.float64):
-    """Concentrate mass near a domain edge with random perturbation.
-
-    The spatial average of each channel equals the given ODE value, so total
-    mass is conserved compared to the uniform case.
-
-    Args:
-        grid_cfg: GridConfig instance.
-        edge: Which edge to concentrate near ('left', 'right', 'top', 'bottom').
-        decay_length: Exponential decay length scale [cm].
-        noise_frac: Relative amplitude of random noise (0.05 = 5%).
-        N1..F4: ODE-equivalent initial values (become the spatial average).
-    """
-    Ny, Nx = grid_cfg.Ny, grid_cfg.Nx
-    dx, dy = grid_cfg.dx, grid_cfg.dy
-    Lx, Ly = grid_cfg.Lx, grid_cfg.Ly
-
-    x = torch.linspace(0.5 * dx, Lx - 0.5 * dx, Nx, device=device, dtype=dtype)
-    y = torch.linspace(0.5 * dy, Ly - 0.5 * dy, Ny, device=device, dtype=dtype)
-    Y, X = torch.meshgrid(y, x, indexing='ij')
-
-    # Distance from chosen edge
-    if edge == 'left':
-        dist = X
-    elif edge == 'right':
-        dist = Lx - X
-    elif edge == 'bottom':
-        dist = Y
-    elif edge == 'top':
-        dist = Ly - Y
-    else:
-        raise ValueError(f"edge must be 'left', 'right', 'top', or 'bottom', got '{edge}'")
-
-    # Exponential decay profile + noise
-    profile = torch.exp(-dist / decay_length)
-    noise = 1.0 + noise_frac * torch.randn(Ny, Nx, device=device, dtype=dtype)
-    profile = (profile * noise).clamp(min=0.0)
-
-    # Normalise so spatial average = 1 → value * profile has correct total mass
-    profile = profile / profile.mean()
-
-    state = torch.zeros(1, 8, Ny, Nx, device=device, dtype=dtype)
+    Nz, Ny, Nx = grid_cfg.Nz, grid_cfg.Ny, grid_cfg.Nx
     values = [N1, N2, Sn, L, F1, F2, F3, F4]
+    B = _infer_batch_size(values)
+
+    state = torch.zeros(B, 8, Nz, Ny, Nx, device=device, dtype=dtype)
     for i, v in enumerate(values):
-        if v > 0:
-            state[:, i] = v * profile
-    return state
-
-
-def stratified_inoculation(grid_cfg, n_colonies=6, colony_radius=0.08,
-                            N1_amount=0.1, N2_amount=0.1,
-                            Sn=0.0, L=0.0,
-                            F1=0.0, F2=0.0, F3=0.0, F4=0.0,
-                            n_samples=1,
-                            device='cpu', dtype=torch.float64):
-    """Place colonies on a uniform (stratified) grid — deterministic counterpart
-    of :func:`random_inoculation`.
-
-    The colony positions are chosen as the cell centres of a roughly-square
-    grid that fits ``n_colonies`` cells inside the domain.  Each colony gets
-    the same N1 and N2 amounts, and positions are identical across samples.
-
-    Args:
-        grid_cfg, colony_radius, Sn..F4: as in :func:`random_inoculation`.
-        n_colonies: Number of colonies (placed on an nx×ny grid where
-            nx*ny == n_colonies and the layout is the most square pair of
-            factors).  Falls back to nearest factor pair if ``n_colonies``
-            is prime — in that case one row of ``n_colonies`` colonies.
-        N1_amount, N2_amount: Peak per-colony amounts (scalar or [B] array).
-        n_samples: Number of samples (positions are shared across samples;
-            only N1/N2 amounts may differ per sample).
-
-    Returns:
-        [n_samples, 8, Ny, Nx] tensor.
-    """
-    Ny, Nx = grid_cfg.Ny, grid_cfg.Nx
-    dx, dy = grid_cfg.dx, grid_cfg.dy
-    Lx, Ly = grid_cfg.Lx, grid_cfg.Ly
-    B = n_samples
-
-    x = torch.linspace(0.5 * dx, Lx - 0.5 * dx, Nx, device=device, dtype=dtype)
-    y = torch.linspace(0.5 * dy, Ly - 0.5 * dy, Ny, device=device, dtype=dtype)
-    Y, X = torch.meshgrid(y, x, indexing='ij')
-
-    def _to_B(v):
-        t = torch.as_tensor(v).to(device=device, dtype=dtype).flatten()
-        if t.numel() == 1:
-            return t.expand(B)
-        return t
-
-    N1_amt = _to_B(N1_amount)
-    N2_amt = _to_B(N2_amount)
-
-    state = torch.zeros(B, 8, Ny, Nx, device=device, dtype=dtype)
-    for ch, val in [(2, Sn), (3, L), (4, F1), (5, F2), (6, F3), (7, F4)]:
-        v_t = torch.as_tensor(val).to(device=device, dtype=dtype).flatten()
+        v_t = torch.as_tensor(v).to(device=device, dtype=dtype).flatten()
         if v_t.numel() == 1:
-            state[:, ch] = v_t.item()
+            state[:, i] = v_t.item()
         else:
-            state[:, ch] = v_t.reshape(B, 1, 1)
+            state[:, i] = v_t.reshape(B, 1, 1, 1)
 
-    # Pick the most-square (ny, nx) factorisation of n_colonies
-    ny_g = max(int(round(n_colonies ** 0.5)), 1)
-    while ny_g > 1 and n_colonies % ny_g != 0:
-        ny_g -= 1
-    nx_g = n_colonies // ny_g
-    if nx_g < ny_g:
-        nx_g, ny_g = ny_g, nx_g
+    sx, sy, sz = (float(s) for s in octant)
+    cx = grid_cfg.Lx * 0.5
+    cy = grid_cfg.Ly * 0.5
+    cz = grid_cfg.Lz * 0.5
+    xs = (torch.arange(Nx, device=device, dtype=dtype) + 0.5) * grid_cfg.dx
+    ys = (torch.arange(Ny, device=device, dtype=dtype) + 0.5) * grid_cfg.dy
+    zs = (torch.arange(Nz, device=device, dtype=dtype) + 0.5) * grid_cfg.dz
+    Z, Y, X = torch.meshgrid(zs, ys, xs, indexing='ij')
+    in_oct = ((sx * (X - cx) >= 0)
+              & (sy * (Y - cy) >= 0)
+              & (sz * (Z - cz) >= 0)).to(dtype)
+    state = state * in_oct.reshape(1, 1, Nz, Ny, Nx)
 
-    N1_view = N1_amt.reshape(B, 1, 1)
-    N2_view = N2_amt.reshape(B, 1, 1)
-    for i in range(nx_g):
-        for j in range(ny_g):
-            cx = (i + 0.5) * Lx / nx_g
-            cy = (j + 0.5) * Ly / ny_g
-            blob = torch.exp(-((X - cx) ** 2 + (Y - cy) ** 2)
-                             / (2 * colony_radius ** 2))
-            state[:, 0] += N1_view * blob
-            state[:, 1] += N2_view * blob
-
-    return state
-
-
-def random_inoculation(grid_cfg, n_colonies=6, colony_radius=0.08,
-                       N1_amount=0.1, N2_amount=0.1,
-                       Sn=0.0, L=0.0,
-                       F1=0.0, F2=0.0, F3=0.0, F4=0.0,
-                       n_samples=1,
-                       device='cpu', dtype=torch.float64):
-    """Scatter small bacterial colonies at random positions.
-
-    Each colony is a Gaussian blob of N1 and/or N2 placed at a random
-    location.  Colonies get independent random amounts of each strain,
-    so some colonies may be N1-dominant, others N2-dominant.  Nutrients
-    are set uniformly (e.g. trace background or zero).
-
-    When ``n_samples > 1``, each sample gets independently randomised
-    colony placements.  Scalar parameters are broadcast; 1-D sequences
-    of length ``n_samples`` give per-sample values.
-
-    Args:
-        grid_cfg: GridConfig instance.
-        n_colonies: Number of colonies to place per sample.
-        colony_radius: Gaussian sigma of each colony [cm].
-        N1_amount: Peak concentration scale for CoA per colony.
-        N2_amount: Peak concentration scale for CoB per colony.
-        Sn, L, F1..F4: Uniform background values for non-bacterial fields.
-        n_samples: Number of independent samples to generate.
-
-    Returns:
-        [n_samples, 8, Ny, Nx] tensor.
-    """
-    Ny, Nx = grid_cfg.Ny, grid_cfg.Nx
-    dx, dy = grid_cfg.dx, grid_cfg.dy
-    Lx, Ly = grid_cfg.Lx, grid_cfg.Ly
-    B = n_samples
-
-    x = torch.linspace(0.5 * dx, Lx - 0.5 * dx, Nx, device=device, dtype=dtype)
-    y = torch.linspace(0.5 * dy, Ly - 0.5 * dy, Ny, device=device, dtype=dtype)
-    Y, X = torch.meshgrid(y, x, indexing='ij')
-
-    # Broadcast helper: scalar → [B], array → [B]
-    def _to_B(v):
-        t = torch.as_tensor(v).to(device=device, dtype=dtype).flatten()
-        if t.numel() == 1:
-            return t.expand(B)
-        return t
-
-    N1_amt = _to_B(N1_amount)
-    N2_amt = _to_B(N2_amount)
-
-    state = torch.zeros(B, 8, Ny, Nx, device=device, dtype=dtype)
-
-    # Uniform backgrounds (per-sample broadcasting)
-    for ch, val in [(2, Sn), (3, L), (4, F1), (5, F2), (6, F3), (7, F4)]:
-        v_t = torch.as_tensor(val).to(device=device, dtype=dtype).flatten()
-        if v_t.numel() == 1:
-            state[:, ch] = v_t.item()
-        else:
-            state[:, ch] = v_t.reshape(B, 1, 1)
-
-    # Random colonies — independent per sample
-    for s in range(B):
-        for _ in range(n_colonies):
-            cx = torch.rand(1, device=device, dtype=dtype).item() * Lx
-            cy = torch.rand(1, device=device, dtype=dtype).item() * Ly
-            blob = torch.exp(-((X - cx)**2 + (Y - cy)**2) / (2 * colony_radius**2))
-
-            frac = torch.rand(1, device=device, dtype=dtype).item()
-            peak_N1 = N1_amt[s].item() * (0.2 + 1.6 * frac)
-            peak_N2 = N2_amt[s].item() * (0.2 + 1.6 * (1 - frac))
-            state[s, 0] += peak_N1 * blob
-            state[s, 1] += peak_N2 * blob
-
+    if mask is not None:
+        m = mask.to(device=device, dtype=dtype)
+        if m.dim() == 3:
+            m = m.reshape(1, 1, Nz, Ny, Nx)
+        state = state * m
     return state

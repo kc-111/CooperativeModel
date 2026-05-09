@@ -1,0 +1,48 @@
+# Open-face divergence diagnostic
+# cache = flow_cache.h5
+# fluid cells = 23400
+# div_open stats over fluid:
+#   abs.max = 1.0341e+01
+#   abs.mean= 2.1653e-01
+#   p99 abs = 1.6595e+00
+
+# Worst 10 fluid cells (largest |div_open|):
+rank   z   y   x       div_open        |v|
+   0  15  29  23  -1.034096e+01 7.8467e-01
+   1  16  29  23  -9.931248e+00 7.5304e-01
+   2  14  29  23  -9.348736e+00 8.0424e-01
+   3  13  29  23  -7.707741e+00 7.9662e-01
+   4  17  29  23  -7.169615e+00 7.2038e-01
+   5  12  29  23  -6.028846e+00 7.6091e-01
+   6  15  25  28  -5.818007e+00 4.9596e-01
+   7  18  29  23  -5.695200e+00 7.2733e-01
+   8  15  26  27  -5.456441e+00 5.8069e-01
+   9  16  25  28  -5.388695e+00 4.0185e-01
+
+# |div_open| histogram (fluid cells)
+  [0e+00, 1e-04)        23
+  [1e-04, 1e-03)       166
+  [1e-03, 1e-02)      1482
+  [1e-02, 1e-01)     10995
+  [1e-01, 1e+00)      9736
+  [1e+00, 1e+01)       997
+  [1e+01, 1e+02)         1
+
+# Closed (no open-face mask) divergence over fluid cells:
+#   abs.max  = 3.1663e+00
+#   abs.mean = 1.7811e-01
+#   p99 abs  = 1.2558e+00
+
+# OPEN-FACE MAC divergence (what species advection now uses) at fluid cells:
+#   abs.max  = 7.5495e-15
+#   abs.mean = 3.6047e-16
+#   p99 abs  = 2.6645e-15
+
+# FORWARD-DIFFERENCE divergence (what flow solver enforces) at fluid cells:
+#   abs.max  = 2.0421e+00
+#   abs.mean = 2.4096e-02
+#   p99 abs  = 6.2486e-01
+#   sum      = 1.4182e+02  (should be near 0; flow solver subtracts mean)
+
+# Predicted exponential growth factor over t=4h: exp(|div_open|_max * 4) = 9.206e+17
+# Observed F1 max/mean ratio at t=4h:           ~ 313

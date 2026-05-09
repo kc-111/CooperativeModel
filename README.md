@@ -1,34 +1,46 @@
 # CooperativeModel
 
-2D reaction-diffusion simulation of a two-strain cooperative microbial consortium (CoA + CoB), implemented in PyTorch.
+3D reaction-advection simulation of a two-strain cooperative microbial consortium (CoA + CoB) inside a cylindrical stirred tank, implemented in PyTorch.  Mixing is supplied entirely by chaotic advection from a non-axisymmetric impeller body force; there is no explicit (eddy / Fickian) diffusion operator.
 
-![Flow-through bioreactor simulation](flow_through_sample0.gif)
+The package is organised as a **two-stage pipeline**: a steady incompressible Navier–Stokes solve over the cylinder produces a velocity field once and caches it to HDF5; species transport then integrates the cooperative kinetics on top of that fixed flow for every Bayesian-optimisation evaluation. The flow is held constant through the BO loop — concentrations evolve, the velocity field does not.
+
+The architecture follows the **CFD-based compartment-model framing** of Delafosse et al. (2014, *Chemical Engineering Science* **106**, 76–85): each finite-volume cell acts as a compartment whose inter-compartment fluxes come from the resolved velocity field. The impeller is represented as a localised body force in the spirit of Pericleous & Patel (1987) and is **non-axisymmetric** (a single angular Gaussian "blade") so that the resulting Lagrangian streamlines are chaotic rather than purely toroidal.
+
+![Flow](blob.gif)
+![Flow-through bioreactor simulation](sample0_topdown.gif)
+![Flow-through bioreactor simulation2](sample0_vertical.gif)
 
 ## Quick Start
+
+```bash
+# Stage 1 — solve and cache the steady flow (slow, run once)
+python scripts/solve_flow.py --out flow_cache.h5
+
+# Stage 2 — species transport on the cached flow (fast, repeated)
+python examples/example.py
+```
 
 ```python
 from CooperativeModel import Simulator
 
-# Closed 2D reactor with stirring + diffusion (ranking matches ODE)
+# Stage 2 in code: the BO objective wraps Simulator.run() and never re-solves Stage 1.
 r = Simulator(
-    N1=0.05, N2=0.05, Sn=0.0, L=0.0, F1=0.0, F2=0.0, F3=0.0, F4=100.0,
-    mode='batch', t_final=72.0, grid_size=50,
-    U_imp=0.5, diffusion_scale=0.1,
+    samples=[[0.05, 0.05, 0.0, 0.0, 25.0, 25.0, 25.0, 25.0]],
+    t_final=48.0, grid_shape=(32, 32, 32),
+    flow_cache_path='flow_cache.h5',
+    ic_mode='uniform',
+    device='cuda',
 ).run()
 print(f'L={r.L_final:.2f}, Sn={r.Sn_final:.2f}')
+r.gif('sample0.gif')              # mid-z slice, wall boundary contoured
 
-# Open reactor with inlet (top-left) / outlet (bottom-right) — the more
-# interesting 2D dynamics, but bacteria do not reach steady-state biomass
-# within 72 h, so absolute L is small and the ranking does not match ODE.
-r = Simulator(
-    N1=0.05, N2=0.05, Sn=0.0, L=0.0, F1=0.0, F2=0.0, F3=0.0, F4=100.0,
-    mode='flow_through', t_final=72.0, grid_size=100,
-    U_imp=0.5, diffusion_scale=0.1, flow_rate=0.05,
-).run()
-r.gif('flow_through.gif')
+# Well-mixed limit: 1x1x1 grid, no flow → the 8-ODE system.
+r = Simulator(samples=[[0.05, 0.05, 0, 0, 25, 25, 25, 25]],
+              grid_shape=(1, 1, 1), flow_cache_path=None,
+              t_final=72.0).run()
 ```
 
-See [`examples/example.py`](examples/example.py) for the full runnable script.
+See [`examples/example.py`](examples/example.py) and [`examples/find_optima.py`](examples/find_optima.py) for the full runnable scripts.
 
 ## Model
 
@@ -67,11 +79,17 @@ $$g_{1,\text{tot}} \;:=\; \frac{\tilde g_{1,\text{tot}}}{1 + (L/K_{p,L})^{h_L}}$
 
 The unhatted $g_{1,\text{tot}}$ is what the rest of the equations use. Setting $K_{p,L}\to\infty$ recovers the original uninhibited $\tilde g_{1,\text{tot}}$.
 
-**Step 4 — Net death rate** (per-sugar toxicity attenuated by nisin self-immunity):
+**Step 4 — Net death rate (split-death model).** Death is decomposed into a *microbial* component (bacteriocin-style, attenuated by nisin self-immunity) and a *chemical* component (per-sugar toxicity, NOT protected by nisin):
 
-$$\delta_1 \;:=\; d_{t_1} \cdot \frac{1 + c_{\text{tox}} \sum_{i} (F_i / K_{\text{tox},i})^{h_{\text{tox}}}}{1 + k_s \, S_n} \qquad \delta_2 \;:=\; d_{t_2} \cdot \frac{1 + c_{\text{tox}} \sum_{i} (F_i / K_{\text{tox},i})^{h_{\text{tox}}}}{1 + k_s \, S_n}$$
+$$\text{Hill}(x) \;:=\; \frac{x^{h_{\text{tox}}}}{1 + x^{h_{\text{tox}}}} \qquad \tau \;:=\; c_{\text{tox}} \sum_{i} \text{Hill}\!\bigl(F_i / K_{\text{tox},i}\bigr)$$
 
-The numerator is the *per-sugar toxicity factor*: each sugar contributes its own additive death penalty with its own threshold $K_{\text{tox},i}$. LAB are sensitive to different sugars in different ways (Maillard / methylglyoxal for glucose, osmotic stress for sucrose, transporter overload for maltose), so the toxicity profile is *species-of-sugar* specific, not a function of $F_{\text{tot}}$. This per-coordinate asymmetry is what places the optima at non-uniform interior $F_i^{*}$ rather than along the diagonal. The denominator is **nisin self-immunity**: producer cells of *L. lactis* express the lipoprotein NisI (which binds and sequesters nisin at the membrane and blocks pore formation) and the ABC exporter NisFEG (which removes cell-associated nisin into the medium). Together these saturate at high $S_n$, so the effective death rate decreases monotonically with $S_n$ via the standard $1/(1 + k_s S_n)$ Kong et al. form (Stein et al., *J. Biol. Chem.* 2003; AlKhatib et al., *PLoS ONE* 2014).
+$$\delta_1 \;:=\; d_{t_1} \cdot \!\left[\,\underbrace{\frac{1}{1 + k_s \, S_n}}_{\text{nisin-protected microbial death}} \;+\; \underbrace{\tau}_{\text{chemical (not nisin-protected)}}\right] \qquad \delta_2 \;:=\; d_{t_2} \cdot \!\left[\frac{1}{1 + k_s \, S_n} + \tau\right]$$
+
+Two biological points:
+
+1. **Per-sugar saturating Hill toxicity.** Each sugar contributes a separate Hill term `Hill(F_i / K_tox,i)` capped at 1, so the four sugars together contribute at most `4·c_tox` to the death-rate multiplier (vs. an unbounded sum in the linear form).  `h_tox > 1` makes the threshold sigmoidal — near-zero below `K_tox,i`, sharp rise above — which keeps moderate-F regions viable while still creating a clear "death zone" at high F.  LAB are sensitive to different sugars in different ways (Maillard / methylglyoxal for glucose, osmotic stress for sucrose, transporter overload for maltose), so the toxicity profile is *species-of-sugar* specific, not a function of $F_{\text{tot}}$.  This per-coordinate asymmetry is what places optima at non-uniform interior $F_i^{*}$ rather than along the diagonal.
+
+2. **Why split-death** (microbial + chemical, rather than a single nisin-protected term). The producer-cell self-immunity machinery — the lipoprotein **NisI** (binds and sequesters nisin at the membrane, blocks pore formation) and the ABC exporter **NisFEG** (removes cell-associated nisin into the medium) — is *bacteriocin-specific*: it neutralises nisin, not generic physico-chemical stresses on the cell envelope and cytoplasm (Stein et al., *J. Biol. Chem.* 2003; AlKhatib et al., *PLoS ONE* 2014).  Putting the per-sugar toxicity inside the same `1/(1 + k_s S_n)` denominator as the microbial term would be saying "any amount of nisin protects against high glucose" — biologically wrong.  Operationally it also collapses the model: once nisin reaches `S_n ≈ 0.005` (with `k_s = 400` this gives `1/(1 + k_s S_n) ≈ 0.33`), the entire death term shrinks to near-zero and high-F runs simply consume all sugar with no penalty, making `L_final` monotone in `F_tot`.  Splitting keeps a chemical-death floor that scales with `F` and exposes the multimodal interior structure of the L-landscape.
 
 **Step 5 — Cooperative nisin production rate** (Kong base × four-sugar co-limitation × CCR):
 
@@ -82,7 +100,7 @@ with $F_{\text{tot}} = \sum_i F_i$. The two multiplicative factors are biologica
 - **Co-limitation** is the *interactive* (multiplicative / Mankin) form, used here for nisin biosynthetic flux rather than for biomass growth: the product is suppressed whenever *any* sugar goes to zero, pushing optima away from the lower bounds of every coordinate. This is the classical product-Monod form for **complementary, non-substitutable inputs** to a single biosynthetic pathway (Megee et al., *Biotechnol. Bioeng.* 1972; Bader, *Biotechnol. Bioeng.* 1978; reviewed in Kovárová-Kovar & Egli, *MMBR* 1998). Saito et al. (2008) categorise this as **Type I (independent) co-limitation** — distinct biochemical roles, all required. Justification for nisin: ribosomal synthesis of the 57-residue precursor, NisB/C-mediated dehydration and cyclisation of Ser/Thr/Cys, and NisT export are all ATP- and cofactor-intensive; sustained throughput requires balanced flux through glycolysis, TCA replenishment, and amino-acid biosynthesis. A diet of one sugar yields imbalanced flux and downregulates secondary metabolism in LAB. The strict Liebig minimum $\min_i F_i / (K_{\text{coop}} + F_i)$ would only track the single most-limiting sugar; the product instead lets all four limitations compound, which is the empirically better fit for complementary inputs (PNAS 2024 dynamic-colimitation framework).
 - **CCR** (carbon-catabolite repression) implements CcpA-mediated repression of secondary-metabolite biosynthesis at high carbohydrate load in LAB. It penalises *high* $F_{\text{tot}}$ and pushes optima away from the upper bounds.
 
-Combined with the per-sugar toxicity term in $\delta_j$, these break the "more sugar → more nisin → more bacteria → more $L$" monotonic chain; the result is a multimodal $L$ landscape with $\sim 89$ distinct local maxima, the majority of which lie strictly inside the operating box.
+Combined with the per-sugar toxicity term in $\delta_j$, these break the "more sugar → more nisin → more bacteria → more $L$" monotonic chain; the result is a multimodal $L$ landscape with **30 distinct local maxima** under the well-mixed scan in `examples/find_optima.py` (eps = 2 separation, `t_final = 72 h`), the majority of which lie strictly inside the operating box.  The current top optimum is `F* ≈ (59.0, 84.9, 0.5, 85.3)` with `L_final ≈ 61.21`; #2 is at `(5.7, 80.1, 92.8, 77.2)` with `L_final ≈ 60.65`.  Each near-edge configuration drops one sugar near zero to escape that sugar's per-sugar toxicity term — `F_3 ≈ 0` is preferred because `K_tox,3 = 55` is the tightest threshold.
 
 **Step 6 — Final ODE system.** Using the symbols defined above:
 
@@ -114,7 +132,7 @@ $$\frac{dF_i}{dt} = -\frac{1}{\gamma_{1,i}} \, \beta_{1,i} \, g_{1,i} \, N_1 - \
 | $Y_L$ | Lactic acid yield | $1.0$ |
 | $n$ | Diauxic shift sharpness | $2.0$ |
 | $K_{p,L},\; h_L$ | Lactate product inhibition (CoA growth) | $35,\; 2$ |
-| $c_{\text{tox}},\; K_{\text{tox},i},\; h_{\text{tox}}$ | Per-sugar toxicity death | $1.5,\; [55, 45, 35, 50],\; 1$ |
+| $c_{\text{tox}},\; K_{\text{tox},i},\; h_{\text{tox}}$ | Per-sugar toxicity (saturating Hill) | $0.4,\; [85, 75, 55, 80],\; 4$ |
 | $K_{\text{coop}}$ | Co-limitation Hill half-sat. (nisin) | $2.0$ |
 | $K_{\text{ccr}},\; h_{\text{ccr}}$ | Catabolite repression (nisin) | $300,\; 2$ |
 
@@ -132,70 +150,57 @@ The base Kong et al. ODE has a single trivial optimum: max all four sugars. To m
 | 4 | Multiplicative co-limitation (nisin) | $P_m$ | $K_{\text{coop}} \to 0$ | Bacteriocin biosynthesis treats the four sugars as complementary, non-substitutable inputs to a single secondary-metabolite flux — the product $\prod_i F_i/(K_{\text{coop}}+F_i)$ of four Hill terms is bounded above by 1 and is suppressed whenever any sugar goes to zero. This is Saito et al. (2008) Type I co-limitation in the multiplicative / Mankin form (Megee 1972; Bader 1978), not metabolic cross-feeding between strains. Pushes optima away from the lower bounds. |
 | 5 | Carbon catabolite repression (nisin) | $P_m$ | $K_{\text{ccr}} \to \infty$ | CcpA-mediated repression of secondary-metabolite biosynthesis at high carbohydrate load. Penalises high $F_{\text{tot}}$ and pushes optima away from the upper bounds. |
 
-(1) and (3) make the death + growth balance asymmetric across sugars; (2) couples sugars through $L$; (4) and (5) make the nisin-protection signal a non-monotone function of $F_{\text{tot}}$, peaked at moderate values. Together these break the single-optimum structure of the base model: a brute-force scan finds $\sim 89$ distinct local maxima of $L_{\text{final}}(F_1,F_2,F_3,F_4)$, $\sim 30$ of which lie strictly inside $(0,100)^4$.
+(1) and (3) make the death + growth balance asymmetric across sugars; (2) couples sugars through $L$; (4) and (5) make the nisin-protection signal a non-monotone function of $F_{\text{tot}}$, peaked at moderate values. Together these break the single-optimum structure of the base model: the well-mixed scan in `examples/find_optima.py` finds **30 distinct local maxima** of $L_{\text{final}}(F_1,F_2,F_3,F_4)$ at $\varepsilon = 2$ separation, most of which lie strictly inside $(0,100)^4$.
 
-### 2D Spatial Extension (PDE)
+### 3D Spatial Extension (PDE)
 
-Each field $y_k$ evolves as a reaction-diffusion-advection PDE:
+Each species $y_k$ evolves on a $32\times32\times32$ Cartesian grid masked to a cylindrical fluid region (axis = $z$, $H/D = 1$, the cylinder fills the cube):
 
-$$\frac{\partial y_k}{\partial t} = R_k(\mathbf{y}) + \nabla \cdot (D_k \, \nabla y_k) - \nabla \cdot (\mathbf{v} \, y_k)$$
+$$\frac{\partial y_k}{\partial t} = R_k(\mathbf{y}) - \nabla \cdot (\mathbf{v} \, y_k)$$
 
 where:
-- $R_k(\mathbf{y})$ — local reaction rate from the ODE above
-- $\nabla \cdot (D_k \, \nabla y_k)$ — Fickian diffusion (8-point stencil, no-flux BCs)
-- $-\nabla \cdot (\mathbf{v} \, y_k)$ — advection by a divergence-free velocity field (upwind scheme)
+- $R_k(\mathbf{y})$ — local reaction rate from the ODE above (kinetics is purely local, so the same `compute_reaction_rates` is reused across the well-mixed and 3D regimes).
+- $-\nabla \cdot (\mathbf{v} \, y_k)$ — advection by the cached velocity field (conservative first-order upwind on the open-face MAC stencil; flux is killed at any face touching a wall).
 
-**Diffusion operator** — 8-direction stencil with face-averaged coefficients:
+**No explicit (Fickian / eddy) diffusion operator.**  Mixing is supplied entirely by chaotic advection from the non-axisymmetric impeller force, plus the small numerical diffusion implicit in first-order upwind on the $32^3$ grid.  This is a deliberate choice: the impeller's chaotic Lagrangian streamlines do the mixing the same way they would in a real stirred tank, and a sub-grid eddy-diffusivity term would just smear out the structure that the projection chain takes care to preserve.
 
-$$\left[\nabla \cdot (D \nabla c)\right]_{i,j} \approx \frac{1}{\Delta x^2} \sum_{k=1}^{8} w_k \, \bar{D}_k \, (c_k - c_{i,j})$$
+**Open-face MAC stencil.** Both the Stage-1 projection and the Stage-2 advection use the same forward-difference divergence with face-flux indicators $\text{op}_{xp}[i] = \text{mask}[i]\cdot\text{mask}[i{+}1]$.  Because the projection drives this exact divergence to zero, a spatially uniform passive scalar is preserved *exactly* under the converged flow (verified in `tests/`).  Mass over the fluid region is conserved to ODE-solver tolerance.
 
-where $w_k = 1$ for cardinal neighbours and $w_k = 1/\sqrt{2}$ for diagonals, and $\bar{D}_k = (D_{i,j} + D_k)/2$.
+**Time integration** — Tsitouras 5(4) adaptive Runge–Kutta with dense output via cubic Hermite interpolation and built-in non-negativity clamping. The advective CFL is automatic:
 
-**Advection operator** — conservative first-order upwind scheme. We discretise $-\nabla \cdot (\mathbf{v}\, c)$ in flux form. For each cell face, the face velocity is averaged from the two adjacent cell centres, and the upwind concentration is selected based on the flow direction:
+$$\Delta t_{\text{adv}} < \frac{\Delta x}{|\mathbf{v}|_{\max}}$$
 
-$$\Phi^x_{i+\frac{1}{2},j} = \bar{v}^x_{i+\frac{1}{2}} \cdot \begin{cases} c_{i,j} & \text{if } \bar{v}^x_{i+\frac{1}{2}} > 0 \\ c_{i+1,j} & \text{otherwise} \end{cases}$$
+Reaction stiffness is handled by the adaptive controller.
 
-where $\bar{v}^x_{i+\frac{1}{2}} = \tfrac{1}{2}(v^x_{i,j} + v^x_{i+1,j})$, and analogously for the $y$-direction. The advection contribution is then:
+### Stage 1 — Steady NS solve and HDF5 cache
 
-$$-\left[\nabla \cdot (\mathbf{v}\, c)\right]_{i,j} \approx -\frac{\Phi^x_{i+\frac{1}{2},j} - \Phi^x_{i-\frac{1}{2},j}}{\Delta x} - \frac{\Phi^y_{i,j+\frac{1}{2}} - \Phi^y_{i,j-\frac{1}{2}}}{\Delta y}$$
+The cylindrical-tank flow is computed once by `solve_steady_flow` (in `flow_3d.py`) and cached to disk by `scripts/solve_flow.py`. The Bayesian-optimisation loop loads the cache and **never** re-solves the flow.
 
-Upwind is chosen for stability: it introduces numerical diffusion that damps oscillations, and is monotone (preserves non-negativity). This is appropriate here because the physical diffusion operator already provides the dominant smoothing; the advection scheme only needs to be stable, not high-order.
+**Geometry.** Closed cylinder ($H/D = 1$) inscribed in a unit cube; the wall mask is built by `cylinder_mask`. No inlet, no outlet — the previous 2D `flow_through` mode is removed, since the spec is a closed vessel.
 
-**Diffusion coefficients:**
+**Forcing — non-axisymmetric impeller body force.** Following the body-force impeller approach of Pericleous & Patel (1987), the impeller is represented as a localised tangential body force rather than a no-slip moving boundary. The new ingredient compared to the classical axisymmetric form is a single angular Gaussian "blade":
 
-| Species | $D$ \[$cm^2/h$\] |
-|---------|-----------|
-| $N_1, N_2$ (bacteria) | $10^{-6}$ |
-| $S_n, L$ (small molecules) | $5 \times 10^{-4}$ |
-| $F_1$–$F_4$ (sugars) | $10^{-4}$ |
+$$\mathbf{f}(r,\theta,z) \;=\; F_0 \,\chi_{rz}(r,z)\,\chi_\theta(\theta)\, \hat{\boldsymbol{\theta}}$$
 
-**Velocity field** (`bioreactor_flow`) — single centered circulation cell as the curl of a sinusoidal stream function:
+$$\chi_{rz}(r,z) = \exp\!\left(-\frac{(r-r_{\text{imp}})^2}{2\sigma_r^2} - \frac{(z-z_{\text{imp}})^2}{2\sigma_z^2}\right) \qquad \chi_\theta(\theta) = \exp\!\left(-\frac{d_{\text{circ}}(\theta,\theta_0)^2}{2\sigma_\theta^2}\right)$$
 
-$$\psi(x,y) = A \, \sin\!\left(\frac{\pi x}{L_x}\right)\sin\!\left(\frac{\pi y}{L_y}\right)$$
+with $d_{\text{circ}}(\theta,\theta_0) = \min(|\theta-\theta_0|,\,2\pi-|\theta-\theta_0|)$. The angular blade breaks the toroidal $\theta$-symmetry of the otherwise axisymmetric forcing. This azimuthal asymmetry is what unlocks **chaotic Lagrangian streamlines** characteristic of real stirred tanks; it is verified by `tests/test_asymmetry.py`.
 
-$$v_x = \partial_y \psi = A \frac{\pi}{L_y}\sin\!\left(\frac{\pi x}{L_x}\right)\cos\!\left(\frac{\pi y}{L_y}\right), \qquad v_y = -\partial_x \psi = -A \frac{\pi}{L_x}\cos\!\left(\frac{\pi x}{L_x}\right)\sin\!\left(\frac{\pi y}{L_y}\right)$$
+**Solver.** Chorin fractional-step projection on a co-located grid:
 
-$\psi = 0$ on all four walls so $\mathbf{v}$ is divergence-free with no-penetration BCs by construction. The amplitude $A$ is rescaled numerically so that $\max|\mathbf{v}| = U_{\text{imp}}$ — peak mean-flow speed is the only stirring knob. Set $U_{\text{imp}} = 0$ for a quiescent reactor.
+1. **Predictor** — explicit Euler with first-order upwind $(\mathbf{u}\cdot\nabla)\mathbf{u}$, a 7-point Laplacian for $\nu\nabla^2\mathbf{u}$, and the impeller body force.
+2. **Pressure Poisson** — 200 red–black Gauss–Seidel sweeps on the **open-face FV Laplacian** with embedded-boundary Neumann BCs.  The right-hand side uses the **open-face MAC divergence** of $\mathbf{u}^*$ so that the discrete chain `div_open ∘ grad_open = lap_open` holds exactly, making the corrector drive `div_open(u_new)` to zero at every fluid cell — including those adjacent to walls.  Pressure is anchored to fluid-mean-zero **after every red–black sweep** (inside the GS loop, not just at the end of each outer step) so warm-starting from previous iterations cannot let the unconstrained Neumann constant drift.
+3. **Corrector** — `u_new = u* − Δt · grad_open(p)`, then re-zero in walls.
 
-**Time integration** — Tsitouras 5(4) adaptive Runge-Kutta with dense output via cubic Hermite interpolation and built-in non-negativity clamping.
+Two metrics are tracked: a step-size residual $\lVert\mathbf{u}^{n+1}-\mathbf{u}^n\rVert_\infty / \max(\lVert\mathbf{u}^n\rVert_\infty,\varepsilon)$ used as the termination criterion, and a periodic **NS residual** $\lVert -(\mathbf{u}\!\cdot\!\nabla)\mathbf{u} + \nu\nabla^2\mathbf{u} + \mathbf{f} - \nabla p\rVert_2$ used as a sanity check on the converged momentum balance.
 
-**CFL condition** — the maximum time step is automatically limited to satisfy both diffusion and advection stability:
+After the outer loop converges, a single **unpreconditioned CG pass** on `−lap_open` drives $|\mathrm{div\_open}(\mathbf{u})|$ to roundoff (typical 50–300 iterations to relative residual $10^{-12}$ at $32^3$); on the production cache the final divergence is $\approx 7.5\times10^{-15}$.  This step is what guarantees a uniform passive scalar is preserved exactly under Stage-2 advection.
 
-$$\Delta t_{\text{diff}} < \frac{\Delta x^2}{2 \, D_{\max} \cdot d} \qquad \Delta t_{\text{adv}} < \frac{\Delta x}{|\mathbf{v}|_{\max}}$$
+**HDF5 cache layout.** `save_flow` writes datasets `/u`, `/v`, `/w`, `/mask` along with attributes that fully reproduce the run (`Nx, Ny, Nz, Lx, Ly, Lz, F0, r_imp, z_imp, sigma_r, sigma_z, theta_0, sigma_theta, nu, dt, n_iters, converged_residual, dtype, code_version, final_cg_iters, final_cg_relres`). `code_version` is **derived from a SHA-256 of the operator-defining functions** (Laplacian, gradient, divergence, advection, pressure GS, CG cleanup, outer driver), so any stencil change auto-bumps the version stamped into the cache — no manual literal to forget. `load_flow` is bit-identical on round-trip (verified by `tests/test_flow_solve_smoke.py`).
 
-where $d = 2$ is the spatial dimension. The solver uses $h_{\max} = 0.4 \cdot \min(\Delta t_{\text{diff}},\, \Delta t_{\text{adv}})$. This is computed automatically from the grid spacing, diffusion coefficients, and velocity field — no user tuning required.
+### Stage 2 — Species transport on the cached flow
 
-### Flow-Through Mode
-
-In `mode='flow_through'`, source/sink terms are added at corner zones:
-
-$$\left.\frac{\partial y_k}{\partial t}\right|_{\text{inlet}} \mathrel{+}= \phi \, (c_{\text{feed},k} - y_k)$$
-
-$$\left.\frac{\partial y_k}{\partial t}\right|_{\text{outlet}} \mathrel{-}= \phi \, y_k$$
-
-where $\phi$ is the `flow_rate` parameter. The feed contains only nutrients (no microbes). Bacteria come from random initial inoculation.
-
-The inlet patch is the upper-left corner (high-row, low-col under `origin='lower'`); the outlet patch is the lower-right corner (low-row, high-col). Inside the outlet patch the velocity is augmented by an additional drain term (+$x$, −$y$) of magnitude $0.2\,U_{\text{imp}}$ on top of the mean stirring flow, so that upwind advection with replicate-pad BCs carries mass off the right and bottom walls.
+`Simulator.run()` calls `load_flow(path)` once per BO evaluation, builds a uniform IC over fluid cells, and integrates the 3D PDE above. Every voxel is a Delafosse-style compartment; inter-compartment fluxes come from the cached velocity field. With `flow_cache_path=None` the simulator uses zero velocity and an all-fluid mask, recovering the well-mixed (0D-equivalent) limit — this is what `examples/example_ode.py` runs.
 
 ## Simulator Parameters
 
@@ -203,30 +208,31 @@ The inlet patch is the upper-left corner (high-row, low-col under `origin='lower
 |-----------|---------|-------------|
 | `N1, N2` | 0.05 | Initial population densities (CoA, CoB) |
 | `Sn, L` | 0.0 | Initial nisin / lactic acid |
-| `F1, F2, F3, F4` | 0, 0, 0, 100 | Initial nutrients (glucose, fructose, sucrose, maltose) |
-| `mode` | `'flow_through'` | `'batch'` or `'flow_through'` |
+| `F1, F2, F3, F4` | 25, 25, 25, 25 | Initial sugars (glucose, fructose, sucrose, maltose) |
+| `samples` | `None` | Optional `[B, 8]` IC tensor (overrides per-channel args) |
 | `t_final` | 72.0 | Integration time [hours] |
 | `n_output` | 145 | Number of output time points |
-| `grid_size` | 100 | Spatial grid points per side |
-| `U_imp` | 0.5 | Peak stirring speed [cm/h]. Set to 0 for quiescent reactor |
-| `diffusion_scale` | 0.1 | Multiplier on diffusion coefficients |
-| `flow_rate` | 0.05 | Inlet/outlet turnover rate [h$^{-1}$] (flow_through only) |
+| `grid_shape` | `(32, 32, 32)` | `(Nz, Ny, Nx)`. Use `(1, 1, 1)` for the well-mixed limit. |
+| `flow_cache_path` | `'flow_cache.h5'` | HDF5 cache from `scripts/solve_flow.py`. `None` ⇒ zero flow + all-fluid mask. |
+| `mixing_scale` | 1.0 | Multiplier on the cached velocity field (e.g. `2.0` halves the eddy turnover time without re-solving Stage 1). |
+| `ic_mode` | `'uniform'` | `'uniform'` distributes each species across all fluid cells; `'octant'` localises the IC to one octant of the cylinder (used to study advective dieback in `examples/example.py`). |
+| `ic_octant` | `(1, 1, 1)` | Sign of `(x, y, z)` selecting the octant when `ic_mode='octant'`. |
 | `device` | `'cpu'` | `'cpu'` or `'cuda'` |
 
 ## Results
 
-`Simulator.run()` returns a `SimResults` object:
+`Simulator.run()` returns a `SimResults` object. Spatial averages are taken over **fluid cells only** (the wall mask does not dilute the reported means):
 
 ```python
-r.L_final           # final lactic acid (spatial average)
-r.Sn_final          # final nisin (spatial average)
+r.L_final           # final lactic acid (fluid average)
+r.Sn_final          # final nisin (fluid average)
 r.elapsed           # wall-clock time [seconds]
 r.final_values()    # dict of all 8 channels at final time
-r.spatial_average() # numpy array [T, 8]
+r.spatial_average() # numpy array [T, 8] (or [B, T, 8] for B>1)
 
-r.gif('out.gif')           # all-channel animated GIF with Sn/L curves
-r.snapshot('out.png')      # spatial heatmap at final time
-r.timeseries('out.png')    # spatially-averaged time series
+r.gif('out.gif')        # mid-z slice animation, wall boundary contoured
+r.snapshot('out.png')   # mid-z heatmap at final time
+r.timeseries('out.png') # fluid-averaged time series
 ```
 
 ## Installation
@@ -253,6 +259,9 @@ r = Simulator(F4=100.0, device='cuda').run()
 ## References
 
 1. Kong, W., Meldgin, D. R., Collins, J. J., and Lu, T. (2018). Designing microbial consortia with defined social interactions. *Nature Chemical Biology*, 14(8), 821-829.
-2. Oliveira, A. P., Nielsen, J., and Forster, J. (2005). Modeling *Lactococcus lactis* using a genome-scale flux model. *BMC Microbiology*, 5(1), 39.
-3. Marsland, R., Cui, W., Goldford, J., and Mehta, P. (2020). The Community Simulator: A Python package for microbial ecology. *PLoS ONE*, 15(3), e0230430.
-4. Tsitouras, C. (2011). Runge-Kutta pairs of order 5(4). *Computers & Mathematics with Applications*, 62(2), 770-775.
+2. Pericleous, K. A., and Patel, M. K. (1987). The modelling of tangential and axial agitators in chemical reactors. *PCH PhysicoChemical Hydrodynamics*, 8(2), 105-123. — body-force impeller model used in Stage 1.
+3. Delafosse, A., Collignon, M.-L., Calvo, S., Delvigne, F., Crine, M., Thonart, P., and Toye, D. (2014). CFD-based compartment model for description of mixing in bioreactors. *Chemical Engineering Science*, **106**, 76-85. — compartment-network framing used in Stage 2.
+4. Chorin, A. J. (1968). Numerical solution of the Navier–Stokes equations. *Mathematics of Computation*, 22(104), 745-762. — fractional-step projection method.
+5. Oliveira, A. P., Nielsen, J., and Forster, J. (2005). Modeling *Lactococcus lactis* using a genome-scale flux model. *BMC Microbiology*, 5(1), 39.
+6. Marsland, R., Cui, W., Goldford, J., and Mehta, P. (2020). The Community Simulator: A Python package for microbial ecology. *PLoS ONE*, 15(3), e0230430.
+7. Tsitouras, C. (2011). Runge-Kutta pairs of order 5(4). *Computers & Mathematics with Applications*, 62(2), 770-775.
