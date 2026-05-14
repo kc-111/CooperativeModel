@@ -2,8 +2,10 @@
 
 A two-stage simulator for a closed cylindrical stirred tank.  Stage 1 solves
 the steady incompressible Navier–Stokes equations once and caches the
-velocity field to disk; Stage 2 advects eight reacting species on top of
-that frozen flow.  Mixing is supplied by chaotic advection from a
+velocity field to disk; Stage 2 advects a 17-channel reacting state
+(four species, four primary resources, four species-specific toxins, four
+species-specific metabolic byproducts, one lactate-style objective) on
+top of that frozen flow.  Mixing is supplied by chaotic advection from a
 non-axisymmetric impeller body force; **no explicit (turbulent) diffusion
 operator is used**.
 
@@ -215,15 +217,89 @@ CLI: `python scripts/solve_flow.py --out flow_cache.h5`.
 
 Implemented in `model.py` and `spatial_operators.py`.
 
-### 3.1  Species
+### 3.1  State variables
 
-Eight species: `N1, N2, Sn, L, F1, F2, F3, F4`.  Local kinetics
-`compute_reaction_rates` is unchanged from the 2D version (purely local,
-shape-agnostic).
+The model carries 17 channels at every fluid voxel:
 
-### 3.2  Equations
+| index | symbol     | meaning                                                            |
+|-------|------------|--------------------------------------------------------------------|
+| 0–3   | `N₁..N₄`   | per-species biomass                                                |
+| 4     | `L`        | scalar objective (lactate-style accumulator)                       |
+| 5–8   | `R₁..R₄`   | primary nutrient resources                                         |
+| 9–12  | `T₁..T₄`   | species-specific toxins (bacteriocin-style)                        |
+| 13–16 | `F₁..F₄`   | species-specific metabolic byproducts (cross-feed pool, see §3.2)  |
 
-For each species `c_α`:
+### 3.2  Local kinetics (`compute_reaction_rates`)
+
+A textbook 4-species Liebig consumer-resource model (Tilman 1980;
+Marsland et al. 2019) on a **cyclic 4-cycle** of species and essential
+resources.  Pairing is
+
+    P₁ = {R₁, R₂},  P₂ = {R₂, R₃},  P₃ = {R₃, R₄},  P₄ = {R₄, R₁}
+
+so each resource is essential to exactly two species and each species is
+Liebig-limited by whichever of its two paired resources is in shortest
+supply:
+
+    g_i(R) = μ_i · min_{j ∈ P_i}  R_j / (K + R_j)
+
+**Metabolic byproducts** (Goyal & Maslov 2018; Pacheco et al. 2019):
+each species secretes its own species-specific byproduct `F_i`, kept in
+a chemical pool distinct from the primary resources `R_j` (so the
+primary `R_j` pool is consumed only — no back-secretion into it).  The
+secretion rate is tied to the **total resource uptake flux** of the
+secretor, not to its growth rate:
+
+    uptake_i   =  2 · c_i · g_i · N_i                   (two paired resources, each
+                                                          consumed at  c_i · g_i · N_i)
+    dF_i/dt    =  σ · uptake_i
+
+`F_i` is tracked as a metabolic observable; it accumulates with uptake
+and does not couple back into growth in the current formulation.  This
+keeps the four single-pair corners of the L(R_init) landscape decoupled
+(no byproduct can revive a starved species through the primary `R`
+pool).
+
+**Species-specific toxins** (bacteriocin-style; Riley & Wertz 2002;
+Czárán et al. 2002; Kerr et al. 2002): each species secretes its own
+toxin at a rate tied to its nutrient-uptake flux, the toxin decays
+first-order, and every *other* species suffers a linear death term
+proportional to the toxins not its own.  A species is **immune to its
+own toxin** (T_i is excluded from the cross-toxin pool seen by N_i):
+
+    T_other,i  =  Σ_{j ≠ i} T_j  =  T_tot − T_i
+    death_i    =  δ · T_other,i · N_i
+    dT_i/dt    =  β · g_i · N_i  −  γ · T_i
+
+The toxin term **removes the all-max corner** of the resource initial
+condition box as a viable global optimum.  At a single-pair corner
+(e.g., R₁, R₂ high; R₃, R₄ low) only one species grows, produces only its
+own toxin, and incurs zero kill on itself.  At the all-max corner all
+four species grow and each is suppressed by the three cross-toxins,
+collapsing total biomass and the L objective.  Linearity in T_other is
+deliberate: a saturating (Hill) death term cannot overcome the carbon
+stoichiometry advantage of the all-max corner under unconstrained
+resource budgets, while a linear term scales with the cross-toxin pool
+and suppresses all-max regardless of the budget.
+
+Yield heterogeneity (`Y = [0.98, 1.02, 1.01, 0.99]`) breaks the
+exact cyclic degeneracy across the four pair corners without changing
+the qualitative topology.
+
+The full batch ODE system at a voxel is
+
+    dN_i/dt  =  g_i · N_i  −  δ · T_other,i · N_i
+    dL/dt    =  Σ_i  Y_i · g_i · N_i
+    dR_j/dt  =  − Σ_{i : j ∈ P_i}  c_i · g_i · N_i
+    dT_i/dt  =  β · g_i · N_i  −  γ · T_i
+    dF_i/dt  =  σ · 2 · c_i · g_i · N_i
+
+All operations are vectorised over the spatial grid
+`[B, 17, Nz, Ny, Nx]`.
+
+### 3.3  Transport equations
+
+For each channel `c_α`:
 
     ∂c_α/∂t  =  −∇·(v c_α) + R_α(c)
 
@@ -235,7 +311,7 @@ For each species `c_α`:
   advection by the non-axisymmetric impeller flow, plus the small
   numerical diffusion implicit in first-order upwind on a 32³ grid.
 
-### 3.3  Spatial discretisation
+### 3.4  Spatial discretisation
 
 `Advection` (in `spatial_operators.py`) implements
 `−∇·(v c)` with conservative first-order upwind:
@@ -254,17 +330,17 @@ Because the divergence stencil here is identical to the one zeroed by
 Stage 1 projection, a uniform field is preserved exactly under the
 converged flow.
 
-### 3.4  Time integration
+### 3.5  Time integration
 
 `Tsit5SolverTorch` (an explicit RK45 with PI step controller) integrates
-`∂y/∂t = R(y) − ∇·(v y)` on the flattened state `y ∈ ℝ^{B × 8 × Nz × Ny × Nx}`.
+`∂y/∂t = R(y) − ∇·(v y)` on the flattened state `y ∈ ℝ^{B × 17 × Nz × Ny × Nx}`.
 The CFL bound used to seed the initial step is
 
     Δt_adv = h_min / |v|_∞
 
 Reaction stiffness is handled by the adaptive controller.
 
-### 3.5  Conservation diagnostics
+### 3.6  Conservation diagnostics
 
 A passive-scalar blob test (`scripts/blob_test.py`) integrates a Gaussian
 blob under pure advection on the production cache and reports:
@@ -305,6 +381,8 @@ the spatial code.
 
 ## 5.  Citations
 
+### Flow (Stage 1)
+
 * **Pericleous, K. A. & Patel, M. K.** (1987). *The modelling of
   tangential and axial agitators in chemical reactors.*
   PhysicoChemical Hydrodynamics **8**(2), 105–123.  Source for the
@@ -314,3 +392,51 @@ the spatial code.
   of single-phase stirred-tank reactors: a multi-scale approach.*
   Chemical Engineering Science **106**, 76–85.  Source for the
   compartment-network framing of Stage 2 transport on the cached flow.
+
+* **Chorin, A. J.** (1968). *Numerical solution of the Navier–Stokes
+  equations.*  Mathematics of Computation **22**(104), 745–762.
+  Fractional-step / projection method used in `solve_steady_flow`.
+
+### Consumer-resource kinetics (Stage 2)
+
+* **Tilman, D.** (1980). *Resources: a graphical-mechanistic approach
+  to competition and predation.*  The American Naturalist **116**(3),
+  362–393.  Original Liebig-style essential-resource competition
+  framework adapted to the cyclic 4-cycle pairing here.
+
+* **Marsland, R. III, Cui, W., Goldford, J., Sanchez, A., Korolev, K.
+  & Mehta, P.** (2019). *Available energy fluxes drive a transition in
+  the diversity, stability, and functional structure of microbial
+  communities.*  PLOS Computational Biology **15**(2), e1006793.
+  Modern microbial consumer-resource framework with cross-feeding
+  byproducts; basis for the σ cross-feeding term.
+
+* **Goyal, A. & Maslov, S.** (2018). *Diversity, stability, and
+  reproducibility in stochastically assembled microbial ecosystems.*
+  Physical Review Letters **120**, 158102.  Network motifs for
+  metabolic cross-feeding cycles on cyclic graphs of species and
+  resources.
+
+* **Pacheco, A. R., Moel, M. & Segrè, D.** (2019). *Costless metabolic
+  secretions as drivers of interspecies interactions in microbial
+  ecosystems.*  Nature Communications **10**, 103.  Mechanistic
+  motivation for cross-feeding flux as a fixed fraction of uptake.
+
+### Bacteriocin-style toxins
+
+* **Riley, M. A. & Wertz, J. E.** (2002). *Bacteriocins: evolution,
+  ecology, and application.*  Annual Review of Microbiology **56**,
+  117–137.  Biological grounding for species-specific toxin secretion
+  with self-immunity.
+
+* **Czárán, T. L., Hoekstra, R. F. & Pagie, L.** (2002). *Chemical
+  warfare between microbes promotes biodiversity.*  Proceedings of the
+  National Academy of Sciences **99**(2), 786–790.  Mathematical model
+  of mutually-antagonistic strains via bacteriocin-style toxins —
+  source for the linear cross-killing term `δ · T_other · N`.
+
+* **Kerr, B., Riley, M. A., Feldman, M. W. & Bohannan, B. J. M.**
+  (2002). *Local dispersal promotes biodiversity in a real-life game of
+  rock–paper–scissors.*  Nature **418**, 171–174.  Empirical and
+  theoretical demonstration that toxin-mediated, non-transitive
+  inhibition supports coexistence on cyclic-pairing graphs.

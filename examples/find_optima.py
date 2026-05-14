@@ -1,25 +1,19 @@
-"""Find local maxima of L_final over (F1, F2, F3, F4) in [0, 100]^4.
+"""Find local maxima of L_final over (R1, R2, R3, R4) initial conditions.
 
 Runs in the **well-mixed limit** (grid_shape=(1, 1, 1), flow_cache_path=None,
 device='cpu'): the optimisation needs hundreds–thousands of objective
-evaluations and the 32^3 PDE costs ~1 s/sample on GPU, while the 8-ODE
-well-mixed system costs ~10 ms/sample on CPU.  The well-mixed kinetics are
-the same kinetics each cell of the 3D PDE evaluates locally, so the L_final
-landscape is *conserved up to spatial-mixing dilution*: a well-mixed local
-optimum F* remains a local optimum in the 3D run with the matching octant
-IC, but the fluid-averaged L is reduced by the volume-fraction occupied by
-the IC plus losses from cells advected into empty regions and dying.
+evaluations and the 32^3 PDE costs ~1 s/sample on GPU, while the 9-ODE
+well-mixed system costs ~10 ms/sample on CPU.
 
 Pipeline:
     1. Batched landscape scan (random interior + 16 corners).
     2. Greedy epsilon-separated selection of the top peaks.
-    3. scipy.optimize.minimize (L-BFGS-B with box constraints [0, 100])
-       from each selected peak.
+    3. scipy.optimize.minimize (L-BFGS-B with box constraints).
     4. Dedup refined optima by Euclidean distance.
 
-To deploy the resulting F* into the 3D PDE, plug the values into
-``examples/example.py`` (which uses ``ic_mode='octant'``); see the docstring
-there for the conservation argument.
+For the cyclic 4-cycle Liebig model with the symmetric defaults, the
+four single-pair corners are expected to land out as the four local
+optima: (R1,R2 hi; R3,R4 lo), (R2,R3 hi; ...), etc.
 
 Usage:
     python examples/find_optima.py
@@ -33,26 +27,36 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from CooperativeModel import Simulator
 
 # ── Config ──────────────────────────────────────────────────────────────
-N1, N2, Sn, L0 = 0.05, 0.05, 0.0, 0.0
-T_FINAL = 72.0
-BOUNDS = [(0.0, 100.0)] * 4
-EPSILON = 2.0
-N_RANDOM = 200
+N0 = 0.01                 # per-species initial biomass
+L0 = 0.0
+T_FINAL = 24.0
+R_MIN, R_MAX = 0.05, 2.0  # resource bounds; R_MIN well below R* ~ K*D/(mu-D)
+BOUNDS = [(R_MIN, R_MAX)] * 4
+# Eps-separation for the final dedup is set in (R1..R4) Euclidean space.
+# 1.0 is roughly half the diagonal of the {LO, HI}^4 corner-set in our
+# bounds, so near-corner L-BFGS-B refinements collapse into one optimum
+# per corner while keeping the four corners distinguishable.
+EPSILON = 1.0
+N_RANDOM = 400
 N_TOP = 30
 DEVICE = 'cpu'
 SEED = 42
 
 
-def eval_batch(sugars):
-    """Vectorised L_final for sugars of shape [B, 4]."""
-    sugars = np.asarray(sugars, dtype=float).reshape(-1, 4)
-    B = len(sugars)
-    samples = np.zeros((B, 8))
-    samples[:, 0] = N1
-    samples[:, 1] = N2
-    samples[:, 2] = Sn
-    samples[:, 3] = L0
-    samples[:, 4:] = sugars
+def eval_batch(resources):
+    """Vectorised L_final for resources of shape [B, 4]."""
+    resources = np.asarray(resources, dtype=float).reshape(-1, 4)
+    B = len(resources)
+    # IC: [N1..N4, L, R1..R4, T1..T4, F1..F4]
+    samples = np.zeros((B, 17))
+    samples[:, 0] = N0
+    samples[:, 1] = N0
+    samples[:, 2] = N0
+    samples[:, 3] = N0
+    samples[:, 4] = L0
+    samples[:, 5:9] = resources
+    # T1..T4 (indices 9..12) and F1..F4 (indices 13..16) stay at zero —
+    # no warfare and no accumulated byproducts at t=0.
     r = Simulator(
         samples=samples.tolist(),
         t_final=T_FINAL, grid_shape=(1, 1, 1),
@@ -85,8 +89,8 @@ def main():
 
     print(f'Landscape scan: {N_RANDOM} random + 16 corner points (well-mixed)...')
     t0 = time.time()
-    random_pts = rng.uniform(0, 100, size=(N_RANDOM, 4))
-    corners = np.array(list(itertools.product([0.0, 100.0], repeat=4)))
+    random_pts = rng.uniform(R_MIN, R_MAX, size=(N_RANDOM, 4))
+    corners = np.array(list(itertools.product([R_MIN, R_MAX], repeat=4)))
     all_pts = np.vstack([corners, random_pts])
     all_L = eval_batch(all_pts)
     print(f'  scan: {time.time() - t0:.1f}s  ({len(all_pts)} evaluations)')
@@ -115,15 +119,33 @@ def main():
         if all(np.linalg.norm(x - x_other) >= EPSILON for x_other, _ in final):
             final.append((x, L_val))
 
-    print(f'\n{"=" * 64}')
+    # Classify each optimum by which pair-corner it is closest to.
+    # P_i = high on resources (i, i+1) modulo 4; LO elsewhere.
+    pair_templates = {
+        'P1 (N1: R1,R2)': np.array([R_MAX, R_MAX, R_MIN, R_MIN]),
+        'P2 (N2: R2,R3)': np.array([R_MIN, R_MAX, R_MAX, R_MIN]),
+        'P3 (N3: R3,R4)': np.array([R_MIN, R_MIN, R_MAX, R_MAX]),
+        'P4 (N4: R4,R1)': np.array([R_MAX, R_MIN, R_MIN, R_MAX]),
+    }
+
+    def classify(x):
+        best_name, best_d = None, np.inf
+        for name, tpl in pair_templates.items():
+            d = float(np.linalg.norm(x - tpl))
+            if d < best_d:
+                best_name, best_d = name, d
+        return best_name, best_d
+
+    print(f'\n{"=" * 72}')
     print(f' {len(final)} DISTINCT LOCAL OPTIMA  (epsilon = {EPSILON})')
-    print(f'{"=" * 64}')
-    print(f'{"#":<4} {"F1":>7} {"F2":>7} {"F3":>7} {"F4":>7} '
-          f'{"sumF":>7} {"L_final":>10}')
-    print('-' * 56)
+    print(f'{"=" * 72}')
+    print(f'{"#":<4} {"R1":>6} {"R2":>6} {"R3":>6} {"R4":>6} '
+          f'{"L_final":>10}   {"closest pair":<16} {"d":>5}')
+    print('-' * 72)
     for i, (x, L_val) in enumerate(final, 1):
-        print(f'{i:<4} {x[0]:>7.2f} {x[1]:>7.2f} {x[2]:>7.2f} {x[3]:>7.2f} '
-              f'{x.sum():>7.2f} {L_val:>10.4f}')
+        name, d = classify(x)
+        print(f'{i:<4} {x[0]:>6.2f} {x[1]:>6.2f} {x[2]:>6.2f} {x[3]:>6.2f} '
+              f'{L_val:>10.4f}   {name:<16} {d:>5.2f}')
 
     if len(final) > 1:
         best_x, best_L = final[0]
@@ -132,7 +154,7 @@ def main():
             gap = best_L - L_val
             pct = 100.0 * gap / best_L if best_L > 0 else float('nan')
             dist = np.linalg.norm(best_x - x)
-            print(f'  #{i}: -{gap:.3f} ({pct:.1f}%), distance = {dist:.1f}')
+            print(f'  #{i}: -{gap:.3f} ({pct:.1f}%), distance = {dist:.2f}')
 
 
 if __name__ == '__main__':

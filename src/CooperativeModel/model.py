@@ -6,12 +6,12 @@ The PDE system for each species y_k is
 
 State tensor shape convention:
 
-    Internal :  [B, 8, Nz, Ny, Nx]   (batch, channels, depth, height, width)
-    Solver   :  [B, 8 * Nz * Ny * Nx] (flat vector for Tsit5)
+    Internal :  [B, 17, Nz, Ny, Nx]   (batch, channels, depth, height, width)
+    Solver   :  [B, 17 * Nz * Ny * Nx] (flat vector for Tsit5)
 
-Channels: ``[N1, N2, Sn, L, F1, F2, F3, F4]``.  The velocity field is treated
-as fixed (cached from Stage 1); the well-mixed limit is recovered by passing
-zero velocity through ``simulate``.
+Channels: ``[N1..N4, L, R1..R4, T1..T4, F1..F4]``.  The velocity field is
+treated as fixed (cached from Stage 1); the well-mixed limit is recovered
+by passing zero velocity through ``simulate``.
 
 Mixing is driven entirely by chaotic advection from the non-axisymmetric
 impeller — there is no explicit sub-grid diffusion term.  First-order upwind
@@ -24,6 +24,9 @@ import torch
 from .kinetics import compute_reaction_rates
 from .spatial_operators import Advection
 from .tsit5_solver import Tsit5SolverTorch
+
+
+N_CHANNELS = 17
 
 
 def compute_cfl_limit(dx, dy, dz, vel_tensor=None, safety=0.4):
@@ -74,9 +77,9 @@ class BioreactorRHS:
 
     @torch.no_grad()
     def __call__(self, t, y_flat, args=None):
-        """``y_flat`` is ``[B, 8*Nz*Ny*Nx]``; returns the same shape."""
+        """``y_flat`` is ``[B, 17*Nz*Ny*Nx]``; returns the same shape."""
         B = y_flat.shape[0]
-        y = y_flat.reshape(B, 8, self.Nz, self.Ny, self.Nx)
+        y = y_flat.reshape(B, N_CHANNELS, self.Nz, self.Ny, self.Nx)
 
         # Clamp non-negative before kinetics; intermediate RK stages can
         # otherwise produce small negative concentrations that feed back into
@@ -96,7 +99,7 @@ def simulate(config, initial_state, velocity_field=None, wall_mask=None):
 
     Args:
         config: ``SimulationConfig`` instance.
-        initial_state: ``[B, 8, Nz, Ny, Nx]`` initial condition tensor.
+        initial_state: ``[B, 17, Nz, Ny, Nx]`` initial condition tensor.
         velocity_field: optional ``[1, 3, Nz, Ny, Nx]`` velocity field
                         (broadcasts over the batch).  ``None`` ⇒ zero
                         velocity (well-mixed / 0D limit).
@@ -104,7 +107,7 @@ def simulate(config, initial_state, velocity_field=None, wall_mask=None):
                         (1 = wall, 0 = fluid).
 
     Returns:
-        results: ``[B, n_output, 8, Nz, Ny, Nx]``.
+        results: ``[B, n_output, 17, Nz, Ny, Nx]``.
         t_eval:  ``[n_output]``.
     """
     device = config.device
@@ -144,6 +147,6 @@ def simulate(config, initial_state, velocity_field=None, wall_mask=None):
     results_flat = solver.solve(rhs, y0_flat, t_span, t_eval,
                                 args=None, h0=h0)
     results = results_flat.reshape(
-        B, len(t_eval), 8, grid.Nz, grid.Ny, grid.Nx,
+        B, len(t_eval), N_CHANNELS, grid.Nz, grid.Ny, grid.Nx,
     )
     return results, t_eval

@@ -1,12 +1,12 @@
 """Visualisation utilities for the 3D bioreactor simulator.
 
 The renderers operate on **mid-z slices** produced by ``SimResults``;
-inputs therefore have shape ``[1, T, 8, Ny, Nx]``.  The wall-fluid
+inputs therefore have shape ``[1, T, 17, Ny, Nx]``.  The wall-fluid
 boundary is overlaid as a white contour from a 2-D ``mask2d``
 (1=fluid, 0=wall) so the cylinder geometry is visible in every frame.
 
 Time-series curves are pre-computed over the full 3-D fluid region by
-``SimResults._fluid_mean`` and passed in as a ``[T, 8]`` array; the
+``SimResults._fluid_mean`` and passed in as a ``[T, 17]`` array; the
 plotting code does not redo the spatial reduction.
 """
 
@@ -16,15 +16,22 @@ import matplotlib.animation as animation
 
 
 CHANNEL_NAMES = [
-    'N1 (CoA)', 'N2 (CoB)', 'Sn (nisin)', 'L (lactic acid)',
-    'F1 (glucose)', 'F2 (fructose)', 'F3 (sucrose)', 'F4 (maltose)',
+    'N1', 'N2', 'N3', 'N4', 'L (lactic acid)',
+    'R1', 'R2', 'R3', 'R4',
+    'T1', 'T2', 'T3', 'T4',
+    'F1', 'F2', 'F3', 'F4',
 ]
 
-# Curves are split into two auto-scaled panels because biomass/products
-# (channels 0-3) and sugars (channels 4-7) routinely differ by ~3 orders
-# of magnitude — a single shared y-axis collapses one group to a flat line.
-_LO_GROUP = (0, 1, 2, 3)   # N1, N2, Sn, L
-_HI_GROUP = (4, 5, 6, 7)   # F1, F2, F3, F4
+# Curves are split into two auto-scaled panels because biomass/product
+# (channels 0-4, 9-12, 13-16) and resources (channels 5-8) routinely differ
+# by orders of magnitude — a single shared y-axis collapses one group to a
+# flat line.  Toxins and byproducts sit with biomass since they share the
+# small scale.
+_LO_GROUP = (0, 1, 2, 3, 4, 9, 10, 11, 12, 13, 14, 15, 16)   # N1..N4, L, T1..T4, F1..F4
+_HI_GROUP = (5, 6, 7, 8)                                       # R1..R4
+
+N_CHANNELS = len(CHANNEL_NAMES)
+L_CH = 4   # lactic acid channel index (updated for new channel layout)
 
 
 def _add_mask_contour(ax, mask2d):
@@ -69,7 +76,6 @@ def _setup_curve_panels(fig, gs, row_idx, ncols_total, t, curve_means,
         groups = [(ax, list(curve_channels), None)]
 
     colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-    L_CH = 3   # lactic acid channel
     lines = []
     vlines = []
     for (ax, channels, label) in groups:
@@ -131,7 +137,7 @@ def plot_snapshot(slice_results, t_eval, time_idx, grid_cfg=None,
     """Plot mid-z-slice heatmaps of selected channels at a given time.
 
     Args:
-        slice_results: ``[1, T, 8, Ny, Nx]`` mid-z slice of the result.
+        slice_results: ``[1, T, 9, Ny, Nx]`` mid-z slice of the result.
         t_eval: ``[T]`` time points.
         time_idx: index into t_eval.
         grid_cfg: optional ``GridConfig`` for axis labels.
@@ -142,7 +148,7 @@ def plot_snapshot(slice_results, t_eval, time_idx, grid_cfg=None,
     t = t_eval[time_idx].item()
 
     if channels is None:
-        channels = list(range(8))
+        channels = list(range(N_CHANNELS))
     nc = len(channels)
     ncols = min(4, nc)
     nrows = (nc + ncols - 1) // ncols
@@ -183,7 +189,7 @@ def plot_spatial_average(means, t_eval, channels=None, figsize=(10, 6)):
     t = t_eval.detach().cpu().numpy() if hasattr(t_eval, 'detach') else np.asarray(t_eval)
 
     if channels is None:
-        channels = list(range(8))
+        channels = list(range(N_CHANNELS))
 
     fig, ax = plt.subplots(figsize=figsize)
     for ch in channels:
@@ -206,7 +212,7 @@ def animate_all_fields_with_curves(slice_results, t_eval, channels=None,
     """Animate mid-z-slice heatmaps with fluid-averaged curves below.
 
     Args:
-        slice_results: ``[1, T, 8, Ny, Nx]`` mid-z slice tensor.
+        slice_results: ``[1, T, 9, Ny, Nx]`` mid-z slice tensor.
         t_eval: ``[T]`` time points.
         channels: heatmap channels (default: all 8).
         curve_channels: channels to plot as time series (default: [2, 3]).
@@ -218,15 +224,15 @@ def animate_all_fields_with_curves(slice_results, t_eval, channels=None,
         save_path: ``.gif`` or ``.mp4`` to save (optional).
     """
     if channels is None:
-        channels = list(range(8))
+        channels = list(range(N_CHANNELS))
     if curve_channels is None:
-        curve_channels = list(range(8))  # all variables
+        curve_channels = list(range(N_CHANNELS))  # all variables
 
     nc = len(channels)
     ncols = min(4, nc)
     nrows_maps = (nc + ncols - 1) // ncols
 
-    data = slice_results[0].detach().cpu().numpy()  # [T, 8, Ny, Nx]
+    data = slice_results[0].detach().cpu().numpy()  # [T, 9, Ny, Nx]
     t = t_eval.detach().cpu().numpy() if hasattr(t_eval, 'detach') else np.asarray(t_eval)
 
     if curve_means is None:
@@ -303,7 +309,7 @@ def animate_orthoviews(slices, masks, t_eval, channels=None,
     """Animate three orthogonal slices (mid-z, mid-y, mid-x) per channel.
 
     Args:
-        slices: tuple ``(slz, sly, slx)`` of three ``[1, T, 8, H, W]``
+        slices: tuple ``(slz, sly, slx)`` of three ``[1, T, 9, H, W]``
             mid-plane tensors (z-, y-, x-perpendicular planes).
         masks: tuple ``(mz, my, mx)`` of 2-D fluid masks for each plane,
             used as white-contour overlays.
@@ -318,16 +324,16 @@ def animate_orthoviews(slices, masks, t_eval, channels=None,
     a fluid-averaged time-series strip below.
     """
     if channels is None:
-        channels = list(range(8))
+        channels = list(range(N_CHANNELS))
     if curve_channels is None:
-        curve_channels = list(range(8))
+        curve_channels = list(range(N_CHANNELS))
 
     slz, sly, slx = slices
     mz, my, mx = masks
     plane_data = [
-        (slz[0].detach().cpu().numpy(), mz, 'mid-z (xy)'),  # [T, 8, Ny, Nx]
-        (sly[0].detach().cpu().numpy(), my, 'mid-y (xz)'),  # [T, 8, Nz, Nx]
-        (slx[0].detach().cpu().numpy(), mx, 'mid-x (yz)'),  # [T, 8, Nz, Ny]
+        (slz[0].detach().cpu().numpy(), mz, 'mid-z (xy)'),  # [T, 9, Ny, Nx]
+        (sly[0].detach().cpu().numpy(), my, 'mid-y (xz)'),  # [T, 9, Nz, Nx]
+        (slx[0].detach().cpu().numpy(), mx, 'mid-x (yz)'),  # [T, 9, Nz, Ny]
     ]
     t = t_eval.detach().cpu().numpy() if hasattr(t_eval, 'detach') else np.asarray(t_eval)
 

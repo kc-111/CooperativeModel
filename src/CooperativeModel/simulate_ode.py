@@ -6,17 +6,17 @@ re-solves the flow.  Pass ``flow_cache_path=None`` to recover the
 well-mixed (0D-equivalent) limit by running with zero velocity and a
 single-cell grid, which is what ``examples/example_ode.py`` does.
 
-Channel ordering is ``[N1, N2, Sn, L, F1, F2, F3, F4]``::
+Channel ordering is ``[N1..N4, L, R1..R4, T1..T4, F1..F4]`` (17 channels)::
 
     from CooperativeModel import Simulator
 
     # Multi-sample run on the cached 32^3 flow.
     r = Simulator(
-        N1=[0.05]*5, N2=[0.05]*5,
-        F1=[10, 25, 50, 75, 100], F2=25.0, F3=25.0, F4=25.0,
+        N1=[0.01]*5, N2=[0.01]*5, N3=[0.01]*5, N4=[0.01]*5,
+        R1=[2.0, 1.5, 1.0, 0.5, 2.0], R2=2.0, R3=0.05, R4=0.05,
         grid_shape=(32, 32, 32),
         flow_cache_path='flow_cache.h5',
-        t_final=48.0,
+        t_final=24.0,
     ).run()
     print(r.L_final)
     r.gif('sample0.gif', sample=0)
@@ -33,24 +33,31 @@ from .initial_conditions import uniform, octant as octant_ic
 from .model import simulate
 
 
-CHANNEL_NAMES = ['N1', 'N2', 'Sn', 'L', 'F1', 'F2', 'F3', 'F4']
+CHANNEL_NAMES = ['N1', 'N2', 'N3', 'N4', 'L',
+                 'R1', 'R2', 'R3', 'R4',
+                 'T1', 'T2', 'T3', 'T4',
+                 'F1', 'F2', 'F3', 'F4']
+N_CHANNELS = len(CHANNEL_NAMES)
+
+# Index of the lactic-acid channel within the state tensor.
+L_CH = 4
 
 
 class SimResults:
     """Results from a 3D simulation.
 
-    Internal state tensor: ``[B, T, 8, Nz, Ny, Nx]``.  Spatial averages and
+    Internal state tensor: ``[B, T, 17, Nz, Ny, Nx]``.  Spatial averages and
     finals are taken **only over fluid cells** (the wall mask is honoured),
     so wall voxels do not dilute the reported means.
 
     For B > 1 scalar properties return numpy arrays of shape ``[B]``;
-    ``spatial_average()`` returns ``[B, T, 8]``.  Visualisation methods
+    ``spatial_average()`` returns ``[B, T, 17]``.  Visualisation methods
     accept a ``sample`` index (default 0) and render a mid-z slice with
     the wall boundary overlaid as a contour.
     """
 
     def __init__(self, results, t_eval, elapsed, grid_cfg, fluid_mask):
-        self.results = results       # [B, T, 8, Nz, Ny, Nx]
+        self.results = results       # [B, T, 17, Nz, Ny, Nx]
         self.t_eval = t_eval         # [T]
         self.elapsed = elapsed       # seconds
         self._grid_cfg = grid_cfg
@@ -71,28 +78,19 @@ class SimResults:
         """Mean of ``field`` (any leading shape, trailing ``[Nz, Ny, Nx]``)
         over fluid cells only."""
         m = self._fluid
-        # Broadcast m over leading dims.
         return (field * m).sum(dim=(-3, -2, -1)) / max(self._fluid_count, 1.0)
 
     @property
     def L_final(self):
         """Fluid-averaged final lactic acid.  Scalar if B=1, ``[B]`` otherwise."""
-        vals = self._fluid_mean(self.results[:, -1, 3])  # [B]
-        if self.n_samples == 1:
-            return vals.item()
-        return vals.detach().cpu().numpy()
-
-    @property
-    def Sn_final(self):
-        """Fluid-averaged final nisin.  Scalar if B=1, ``[B]`` otherwise."""
-        vals = self._fluid_mean(self.results[:, -1, 2])
+        vals = self._fluid_mean(self.results[:, -1, L_CH])
         if self.n_samples == 1:
             return vals.item()
         return vals.detach().cpu().numpy()
 
     def final_values(self):
-        """Dict of fluid-averaged final values for all 8 channels."""
-        vals = self._fluid_mean(self.results[:, -1])  # [B, 8]
+        """Dict of fluid-averaged final values for all channels."""
+        vals = self._fluid_mean(self.results[:, -1])  # [B, 17]
         if self.n_samples == 1:
             return {name: vals[0, i].item()
                     for i, name in enumerate(CHANNEL_NAMES)}
@@ -103,71 +101,57 @@ class SimResults:
     def spatial_average(self):
         """Fluid-averaged time series.
 
-        Returns ``[T, 8]`` numpy if B=1, ``[B, T, 8]`` if B>1.
+        Returns ``[T, 17]`` numpy if B=1, ``[B, T, 17]`` if B>1.
         """
-        avg = self._fluid_mean(self.results)  # [B, T, 8]
+        avg = self._fluid_mean(self.results)  # [B, T, 17]
         if self.n_samples == 1:
             return avg[0].detach().cpu().numpy()
         return avg.detach().cpu().numpy()
 
     def _midz_view(self, sample):
-        """Return a ``[1, T, 8, Ny, Nx]`` mid-z slice for visualisation."""
+        """Return a ``[1, T, 17, Ny, Nx]`` mid-z slice for visualisation."""
         Nz = self.results.shape[-3]
         zmid = Nz // 2
-        slc = self.results[sample:sample + 1, :, :, zmid]  # [1, T, 8, Ny, Nx]
+        slc = self.results[sample:sample + 1, :, :, zmid]
         mask2d = self._fluid[zmid].detach().cpu().numpy()
         return slc, mask2d
 
     def _midy_view(self, sample):
-        """Return a ``[1, T, 8, Nz, Nx]`` mid-y vertical slice (XZ plane).
-
-        This is a vertical cross-section through the cylinder axis at
-        ``y = Ly/2``: rows are z (height), columns are x.
-        """
+        """Return a ``[1, T, 17, Nz, Nx]`` mid-y vertical slice (XZ plane)."""
         Ny = self.results.shape[-2]
         ymid = Ny // 2
-        slc = self.results[sample:sample + 1, :, :, :, ymid]  # [1,T,8,Nz,Nx]
+        slc = self.results[sample:sample + 1, :, :, :, ymid]
         mask2d = self._fluid[:, ymid].detach().cpu().numpy()
         return slc, mask2d
 
     def _midx_view(self, sample):
-        """Return a ``[1, T, 8, Nz, Ny]`` mid-x vertical slice (YZ plane).
-
-        This is a vertical cross-section through the cylinder axis at
-        ``x = Lx/2``: rows are z (height), columns are y.
-        """
+        """Return a ``[1, T, 17, Nz, Ny]`` mid-x vertical slice (YZ plane)."""
         Nx = self.results.shape[-1]
         xmid = Nx // 2
-        slc = self.results[sample:sample + 1, :, :, :, :, xmid]  # [1,T,8,Nz,Ny]
+        slc = self.results[sample:sample + 1, :, :, :, :, xmid]
         mask2d = self._fluid[:, :, xmid].detach().cpu().numpy()
         return slc, mask2d
 
     def _topdown_view(self, sample):
-        """Return a ``[1, T, 8, Ny, Nx]`` z-aggregated view (fluid-mean
+        """Return a ``[1, T, 17, Ny, Nx]`` z-aggregated view (fluid-mean
         along the cylinder axis) plus the 2-D footprint mask."""
         m = self._fluid                                               # [Nz, Ny, Nx]
         col_count = m.sum(dim=0).clamp(min=1.0)                       # [Ny, Nx]
-        # Weighted sum along z then divide by column count.
-        weighted = self.results[sample:sample + 1] * m                # broadcasts over [B,T,8,Nz,Ny,Nx]
-        proj = weighted.sum(dim=-3) / col_count                       # [1, T, 8, Ny, Nx]
+        weighted = self.results[sample:sample + 1] * m
+        proj = weighted.sum(dim=-3) / col_count
         footprint = (m.sum(dim=0) > 0).to(dtype=m.dtype).detach().cpu().numpy()
         return proj, footprint
 
     def _ortho_views(self, sample):
-        """Return mid-z, mid-y, mid-x slices and their 2-D wall masks.
-
-        Each slice is shaped ``[1, T, 8, H, W]`` for visualisation; the
-        masks are 2-D arrays.
-        """
+        """Return mid-z, mid-y, mid-x slices and their 2-D wall masks."""
         Nz, Ny, Nx = self.results.shape[-3], self.results.shape[-2], self.results.shape[-1]
         zmid, ymid, xmid = Nz // 2, Ny // 2, Nx // 2
-        # Mid-z: (Ny, Nx) plane  -> already (..., Nz=zmid, Ny, Nx)
-        slz = self.results[sample:sample + 1, :, :, zmid]                  # [1,T,8,Ny,Nx]
-        sly = self.results[sample:sample + 1, :, :, :, ymid]               # [1,T,8,Nz,Nx]
-        slx = self.results[sample:sample + 1, :, :, :, :, xmid]            # [1,T,8,Nz,Ny]
-        mz = self._fluid[zmid].detach().cpu().numpy()                      # [Ny, Nx]
-        my = self._fluid[:, ymid].detach().cpu().numpy()                   # [Nz, Nx]
-        mx = self._fluid[:, :, xmid].detach().cpu().numpy()                # [Nz, Ny]
+        slz = self.results[sample:sample + 1, :, :, zmid]
+        sly = self.results[sample:sample + 1, :, :, :, ymid]
+        slx = self.results[sample:sample + 1, :, :, :, :, xmid]
+        mz = self._fluid[zmid].detach().cpu().numpy()
+        my = self._fluid[:, ymid].detach().cpu().numpy()
+        mx = self._fluid[:, :, xmid].detach().cpu().numpy()
         return (slz, sly, slx), (mz, my, mx)
 
     def gif(self, path='simulation.gif', curve_channels=None, sample=0,
@@ -176,9 +160,10 @@ class SimResults:
 
         Args:
             path: output file path.
-            curve_channels: channels to plot as time series (default: all 8,
-                automatically split into a biomass+products panel and a
-                sugars panel so each is auto-scaled to its own data range).
+            curve_channels: channels to plot as time series (default: all
+                channels, automatically split into a biomass+product panel
+                and a resource panel so each is auto-scaled to its own
+                data range).
             sample: sample index to visualise.
             view: ``'midz'`` (default) renders the mid-z (xy) slice;
                   ``'midy'`` renders the mid-y vertical (xz) slice through
@@ -190,8 +175,8 @@ class SimResults:
                   per channel.
         """
         if curve_channels is None:
-            curve_channels = list(range(8))
-        means_full = self._fluid_mean(self.results[sample:sample + 1])     # [1, T, 8]
+            curve_channels = list(range(N_CHANNELS))
+        means_full = self._fluid_mean(self.results[sample:sample + 1])     # [1, T, 17]
         means_np = means_full[0].detach().cpu().numpy()
 
         if view == 'midz':
@@ -278,13 +263,15 @@ class Simulator:
     """3D bioreactor simulator with multi-sample support.
 
     Args:
-        N1, N2, Sn, L, F1, F2, F3, F4: per-channel initial concentrations
-            (uniform over fluid cells).  Each can be a scalar or a 1-D
-            sequence/tensor of length B (multi-sample run).
-        samples: optional ``[B, 8]`` tensor (or nested list) of full
+        N1, N2, N3, N4, L, R1, R2, R3, R4, T1, T2, T3, T4, F1, F2, F3, F4:
+            per-channel initial concentrations (uniform over fluid cells).
+            Each can be a scalar or a 1-D sequence/tensor of length B
+            (multi-sample run).  Toxins and byproducts default to zero
+            (no warfare, no metabolic history at t=0).
+        samples: optional ``[B, 17]`` tensor (or nested list) of full
             initial conditions; overrides the per-channel arguments.
-        t_final: integration time [hours].  Default 72.
-        n_output: number of output time points.  Default 145.
+        t_final: integration time [hours].  Default 24.
+        n_output: number of output time points.  Default 49.
         grid_shape: ``(Nz, Ny, Nx)``.  Default ``(32, 32, 32)``.  Use
             ``(1, 1, 1)`` together with ``flow_cache_path=None`` for the
             well-mixed (0D-equivalent) limit.
@@ -293,15 +280,9 @@ class Simulator:
             with zero velocity and an all-fluid mask of the requested
             ``grid_shape`` (well-mixed regime).
         mixing_scale: multiplier on the cached velocity field.  Default
-            1.0 (use the flow as solved).  Scaling is mass-conserving — a
-            divergence-free field stays divergence-free under uniform
-            scaling, so the open-face MAC divergence remains zero.  Use
-            this knob to dial the mixing rate up/down without re-solving
-            the NS problem (e.g. ``mixing_scale=2.0`` halves the eddy
-            turnover time).  Ignored when ``flow_cache_path is None``.
+            1.0.  Ignored when ``flow_cache_path is None``.
         ic_mode: ``'uniform'`` (default) loads each species into every
-            fluid cell at its specified value — a spatially uniform
-            initial state, the right setting for the BO objective.
+            fluid cell at its specified value.
             ``'octant'`` loads each species into a single octant of the
             vessel only (zero elsewhere) so chaotic advection has visible
             work to do; useful for visualisation and mixing diagnostics.
@@ -312,23 +293,32 @@ class Simulator:
 
     Example::
 
-        r = Simulator(samples=[[0.05, 0.05, 0, 0, 25, 25, 25, 25]],
+        r = Simulator(samples=[[0.01, 0.01, 0.01, 0.01, 0.0,
+                                 2, 2, 0.05, 0.05,
+                                 0, 0, 0, 0,
+                                 0, 0, 0, 0]],
                       grid_shape=(32, 32, 32),
                       flow_cache_path='flow_cache.h5',
-                      t_final=48.0).run()
+                      t_final=24.0).run()
     """
 
-    def __init__(self, N1=0.05, N2=0.05, Sn=0.0, L=0.0,
-                 F1=25.0, F2=25.0, F3=25.0, F4=25.0,
+    def __init__(self, N1=0.01, N2=0.01, N3=0.01, N4=0.01, L=0.0,
+                 R1=2.0, R2=2.0, R3=2.0, R4=2.0,
+                 T1=0.0, T2=0.0, T3=0.0, T4=0.0,
+                 F1=0.0, F2=0.0, F3=0.0, F4=0.0,
                  *, samples=None,
-                 t_final=72.0, n_output=145,
+                 t_final=24.0, n_output=49,
                  grid_shape=(32, 32, 32),
                  flow_cache_path='flow_cache.h5',
                  mixing_scale=1.0,
                  ic_mode='uniform',
                  ic_octant=(1, 1, 1),
                  device='cpu'):
-        self._ic = self._normalize_ic(N1, N2, Sn, L, F1, F2, F3, F4, samples)
+        self._ic = self._normalize_ic(
+            N1, N2, N3, N4, L, R1, R2, R3, R4,
+            T1, T2, T3, T4,
+            F1, F2, F3, F4, samples,
+        )
         self.t_final = t_final
         self.n_output = n_output
         self.grid_shape = tuple(grid_shape)
@@ -347,19 +337,23 @@ class Simulator:
         self.device = device
 
     @staticmethod
-    def _normalize_ic(N1, N2, Sn, L, F1, F2, F3, F4, samples):
-        """Convert IC specification to a ``[B, 8]`` CPU float64 tensor."""
+    def _normalize_ic(N1, N2, N3, N4, L, R1, R2, R3, R4,
+                     T1, T2, T3, T4,
+                     F1, F2, F3, F4, samples):
+        """Convert IC specification to a ``[B, 17]`` CPU float64 tensor."""
         if samples is not None:
             s = torch.as_tensor(samples).to(dtype=torch.float64, device='cpu')
             if s.ndim == 1:
                 s = s.unsqueeze(0)
-            if s.ndim != 2 or s.shape[1] != 8:
+            if s.ndim != 2 or s.shape[1] != N_CHANNELS:
                 raise ValueError(
-                    f'samples must be [B, 8] or [8]; got shape {list(s.shape)}'
+                    f'samples must be [B, {N_CHANNELS}] or [{N_CHANNELS}]; '
+                    f'got shape {list(s.shape)}'
                 )
             return s
 
-        vals = [N1, N2, Sn, L, F1, F2, F3, F4]
+        vals = [N1, N2, N3, N4, L, R1, R2, R3, R4, T1, T2, T3, T4,
+                F1, F2, F3, F4]
         B = 1
         for v in vals:
             if not isinstance(v, (int, float)):
@@ -374,7 +368,7 @@ class Simulator:
                         f'got {B} and {n}'
                     )
 
-        result = torch.zeros(B, 8, dtype=torch.float64)
+        result = torch.zeros(B, N_CHANNELS, dtype=torch.float64)
         for i, v in enumerate(vals):
             t = torch.as_tensor(v).to(dtype=torch.float64, device='cpu').flatten()
             if t.numel() == 1:
@@ -430,13 +424,10 @@ class Simulator:
             vel = None
             wall_mask = None
 
-        # Geometry: use unit cube extents (the cached HDF5 stores its own
-        # Lx/Ly/Lz, but with H/D=1 cylinder fitting the cube the scaling is
-        # uniform — all spatial operators only need dx/dy/dz).
         grid = GridConfig(Nx=Nx, Ny=Ny, Nz=Nz)
         config = self._make_config(grid)
 
-        # Build IC ``[B, 8, Nz, Ny, Nx]``.
+        # Build IC ``[B, 17, Nz, Ny, Nx]``.
         ic_kwargs = {name: self._ic[:, i] for i, name in enumerate(CHANNEL_NAMES)}
         if self.ic_mode == 'octant':
             y0 = octant_ic(grid, mask=fluid, octant=self.ic_octant,
