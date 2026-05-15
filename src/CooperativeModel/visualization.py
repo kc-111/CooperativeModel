@@ -1,12 +1,12 @@
 """Visualisation utilities for the 3D bioreactor simulator.
 
 The renderers operate on **mid-z slices** produced by ``SimResults``;
-inputs therefore have shape ``[1, T, 17, Ny, Nx]``.  The wall-fluid
+inputs therefore have shape ``[1, T, 13, Ny, Nx]``.  The wall-fluid
 boundary is overlaid as a white contour from a 2-D ``mask2d``
 (1=fluid, 0=wall) so the cylinder geometry is visible in every frame.
 
 Time-series curves are pre-computed over the full 3-D fluid region by
-``SimResults._fluid_mean`` and passed in as a ``[T, 17]`` array; the
+``SimResults._fluid_mean`` and passed in as a ``[T, 13]`` array; the
 plotting code does not redo the spatial reduction.
 """
 
@@ -19,16 +19,14 @@ CHANNEL_NAMES = [
     'N1', 'N2', 'N3', 'N4', 'L (lactic acid)',
     'R1', 'R2', 'R3', 'R4',
     'T1', 'T2', 'T3', 'T4',
-    'F1', 'F2', 'F3', 'F4',
 ]
 
 # Curves are split into two auto-scaled panels because biomass/product
-# (channels 0-4, 9-12, 13-16) and resources (channels 5-8) routinely differ
+# (channels 0-4, 9-12) and resources (channels 5-8) routinely differ
 # by orders of magnitude — a single shared y-axis collapses one group to a
-# flat line.  Toxins and byproducts sit with biomass since they share the
-# small scale.
-_LO_GROUP = (0, 1, 2, 3, 4, 9, 10, 11, 12, 13, 14, 15, 16)   # N1..N4, L, T1..T4, F1..F4
-_HI_GROUP = (5, 6, 7, 8)                                       # R1..R4
+# flat line.  Toxins sit with biomass since they share the small scale.
+_LO_GROUP = (0, 1, 2, 3, 4, 9, 10, 11, 12)   # N1..N4, L, T1..T4
+_HI_GROUP = (5, 6, 7, 8)                       # R1..R4
 
 N_CHANNELS = len(CHANNEL_NAMES)
 L_CH = 4   # lactic acid channel index (updated for new channel layout)

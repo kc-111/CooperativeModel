@@ -34,10 +34,9 @@ CANDIDATES = [
     ('all-max (ref)',     1.0,   1.0,   1.0,   1.0),
 ]
 
-# IC layout: [N1..N4, L, R1..R4, T1..T4, F1..F4]
+# IC layout: [N1..N4, L, R1..R4, T1..T4]
 N0 = 0.01
 samples = [[N0, N0, N0, N0, 0.0, R1, R2, R3, R4,
-            0.0, 0.0, 0.0, 0.0,
             0.0, 0.0, 0.0, 0.0]
            for (_, R1, R2, R3, R4) in CANDIDATES]
 

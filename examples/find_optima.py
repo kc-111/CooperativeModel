@@ -47,16 +47,15 @@ def eval_batch(resources):
     """Vectorised L_final for resources of shape [B, 4]."""
     resources = np.asarray(resources, dtype=float).reshape(-1, 4)
     B = len(resources)
-    # IC: [N1..N4, L, R1..R4, T1..T4, F1..F4]
-    samples = np.zeros((B, 17))
+    # IC: [N1..N4, L, R1..R4, T1..T4]
+    samples = np.zeros((B, 13))
     samples[:, 0] = N0
     samples[:, 1] = N0
     samples[:, 2] = N0
     samples[:, 3] = N0
     samples[:, 4] = L0
     samples[:, 5:9] = resources
-    # T1..T4 (indices 9..12) and F1..F4 (indices 13..16) stay at zero —
-    # no warfare and no accumulated byproducts at t=0.
+    # T1..T4 (indices 9..12) stay at zero — no warfare at t=0.
     r = Simulator(
         samples=samples.tolist(),
         t_final=T_FINAL, grid_shape=(1, 1, 1),

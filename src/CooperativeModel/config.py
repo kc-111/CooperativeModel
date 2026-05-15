@@ -1,7 +1,7 @@
 """Configuration and parameters for the 3D bioreactor model.
 
-Model: 4-species Liebig consumer-resource on a cyclic 4-cycle (batch mode
-with cross-feeding); see ``kinetics.py`` for the equations.
+Model: 4-species Liebig consumer-resource on a cyclic 4-cycle (batch mode);
+see ``kinetics.py`` for the equations.
 
 Grid and solver settings are also defined here.  Explicit species
 diffusion is not modelled: mixing in the 3D run is driven entirely by
@@ -38,12 +38,6 @@ class ModelParameters:
     # Per-species lactate yield: dL/dt = sum_i Y_i * g_i * N_i.
     Y: list = field(default_factory=lambda: [0.995, 1.001, 1.005, 0.999])
 
-    # Cross-feeding strength.  Each species secretes its antipodal resource
-    # (the one not in its growth pair) at rate ``sigma * g_i * N_i``.  Small
-    # sigma keeps the four single-pair corners well-separated; large sigma
-    # bridges missing resources and erodes the multimodality.
-    sigma: float = 0.1
-
     # Toxin production rate per unit nutrient-uptake flux: dT_i/dt has a
     # source term ``beta * g_i * N_i``.  Each species secretes its own
     # species-specific toxin and is immune to it.
@@ -75,7 +69,6 @@ class ModelParameters:
             'K': self.K,
             'c': _t(self.c),
             'Y': _t(self.Y),
-            'sigma': self.sigma,
             'beta': self.beta,
             'gamma': self.gamma,
             'delta': self.delta,

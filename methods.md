@@ -2,12 +2,11 @@
 
 A two-stage simulator for a closed cylindrical stirred tank.  Stage 1 solves
 the steady incompressible Navier–Stokes equations once and caches the
-velocity field to disk; Stage 2 advects a 17-channel reacting state
-(four species, four primary resources, four species-specific toxins, four
-species-specific metabolic byproducts, one lactate-style objective) on
-top of that frozen flow.  Mixing is supplied by chaotic advection from a
-non-axisymmetric impeller body force; **no explicit (turbulent) diffusion
-operator is used**.
+velocity field to disk; Stage 2 advects a 13-channel reacting state
+(four species, four primary resources, four species-specific toxins, one
+lactate-style objective) on top of that frozen flow.  Mixing is supplied
+by chaotic advection from a non-axisymmetric impeller body force; **no
+explicit (turbulent) diffusion operator is used**.
 
 The code follows the framing of Delafosse et al. (2014) — every voxel in
 the converged flow plays the role of a Delafosse-style compartment, and
@@ -219,7 +218,7 @@ Implemented in `model.py` and `spatial_operators.py`.
 
 ### 3.1  State variables
 
-The model carries 17 channels at every fluid voxel:
+The model carries 13 channels at every fluid voxel:
 
 | index | symbol     | meaning                                                            |
 |-------|------------|--------------------------------------------------------------------|
@@ -227,13 +226,11 @@ The model carries 17 channels at every fluid voxel:
 | 4     | `L`        | scalar objective (lactate-style accumulator)                       |
 | 5–8   | `R₁..R₄`   | primary nutrient resources                                         |
 | 9–12  | `T₁..T₄`   | species-specific toxins (bacteriocin-style)                        |
-| 13–16 | `F₁..F₄`   | species-specific metabolic byproducts (cross-feed pool, see §3.2)  |
 
 ### 3.2  Local kinetics (`compute_reaction_rates`)
 
-A textbook 4-species Liebig consumer-resource model (Tilman 1980;
-Marsland et al. 2019) on a **cyclic 4-cycle** of species and essential
-resources.  Pairing is
+A textbook 4-species Liebig consumer-resource model (Tilman 1980) on a
+**cyclic 4-cycle** of species and essential resources.  Pairing is
 
     P₁ = {R₁, R₂},  P₂ = {R₂, R₃},  P₃ = {R₃, R₄},  P₄ = {R₄, R₁}
 
@@ -242,23 +239,6 @@ Liebig-limited by whichever of its two paired resources is in shortest
 supply:
 
     g_i(R) = μ_i · min_{j ∈ P_i}  R_j / (K + R_j)
-
-**Metabolic byproducts** (Goyal & Maslov 2018; Pacheco et al. 2019):
-each species secretes its own species-specific byproduct `F_i`, kept in
-a chemical pool distinct from the primary resources `R_j` (so the
-primary `R_j` pool is consumed only — no back-secretion into it).  The
-secretion rate is tied to the **total resource uptake flux** of the
-secretor, not to its growth rate:
-
-    uptake_i   =  2 · c_i · g_i · N_i                   (two paired resources, each
-                                                          consumed at  c_i · g_i · N_i)
-    dF_i/dt    =  σ · uptake_i
-
-`F_i` is tracked as a metabolic observable; it accumulates with uptake
-and does not couple back into growth in the current formulation.  This
-keeps the four single-pair corners of the L(R_init) landscape decoupled
-(no byproduct can revive a starved species through the primary `R`
-pool).
 
 **Species-specific toxins** (bacteriocin-style; Riley & Wertz 2002;
 Czárán et al. 2002; Kerr et al. 2002): each species secretes its own
@@ -292,10 +272,9 @@ The full batch ODE system at a voxel is
     dL/dt    =  Σ_i  Y_i · g_i · N_i
     dR_j/dt  =  − Σ_{i : j ∈ P_i}  c_i · g_i · N_i
     dT_i/dt  =  β · g_i · N_i  −  γ · T_i
-    dF_i/dt  =  σ · 2 · c_i · g_i · N_i
 
 All operations are vectorised over the spatial grid
-`[B, 17, Nz, Ny, Nx]`.
+`[B, 13, Nz, Ny, Nx]`.
 
 ### 3.3  Transport equations
 
@@ -333,7 +312,7 @@ converged flow.
 ### 3.5  Time integration
 
 `Tsit5SolverTorch` (an explicit RK45 with PI step controller) integrates
-`∂y/∂t = R(y) − ∇·(v y)` on the flattened state `y ∈ ℝ^{B × 17 × Nz × Ny × Nx}`.
+`∂y/∂t = R(y) − ∇·(v y)` on the flattened state `y ∈ ℝ^{B × 13 × Nz × Ny × Nx}`.
 The CFL bound used to seed the initial step is
 
     Δt_adv = h_min / |v|_∞
@@ -403,24 +382,6 @@ the spatial code.
   to competition and predation.*  The American Naturalist **116**(3),
   362–393.  Original Liebig-style essential-resource competition
   framework adapted to the cyclic 4-cycle pairing here.
-
-* **Marsland, R. III, Cui, W., Goldford, J., Sanchez, A., Korolev, K.
-  & Mehta, P.** (2019). *Available energy fluxes drive a transition in
-  the diversity, stability, and functional structure of microbial
-  communities.*  PLOS Computational Biology **15**(2), e1006793.
-  Modern microbial consumer-resource framework with cross-feeding
-  byproducts; basis for the σ cross-feeding term.
-
-* **Goyal, A. & Maslov, S.** (2018). *Diversity, stability, and
-  reproducibility in stochastically assembled microbial ecosystems.*
-  Physical Review Letters **120**, 158102.  Network motifs for
-  metabolic cross-feeding cycles on cyclic graphs of species and
-  resources.
-
-* **Pacheco, A. R., Moel, M. & Segrè, D.** (2019). *Costless metabolic
-  secretions as drivers of interspecies interactions in microbial
-  ecosystems.*  Nature Communications **10**, 103.  Mechanistic
-  motivation for cross-feeding flux as a fixed fraction of uptake.
 
 ### Bacteriocin-style toxins
 

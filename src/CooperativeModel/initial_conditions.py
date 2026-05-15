@@ -1,6 +1,6 @@
 """Initial-condition generators for the 3D bioreactor model.
 
-Channel ordering: ``[N1..N4, L, R1..R4, T1..T4, F1..F4]`` (17 channels).
+Channel ordering: ``[N1..N4, L, R1..R4, T1..T4]`` (13 channels).
 
 Two generators:
 
@@ -15,7 +15,7 @@ Two generators:
 import torch
 
 
-N_CHANNELS = 17
+N_CHANNELS = 13
 
 
 def _infer_batch_size(values):
@@ -41,9 +41,8 @@ def _infer_batch_size(values):
 def uniform(grid_cfg, N1=0.01, N2=0.01, N3=0.01, N4=0.01, L=0.0,
             R1=2.0, R2=2.0, R3=2.0, R4=2.0,
             T1=0.0, T2=0.0, T3=0.0, T4=0.0,
-            F1=0.0, F2=0.0, F3=0.0, F4=0.0,
             mask=None, device='cpu', dtype=torch.float64):
-    """Spatially-uniform initial condition, ``[B, 17, Nz, Ny, Nx]``.
+    """Spatially-uniform initial condition, ``[B, 13, Nz, Ny, Nx]``.
 
     Each value can be a scalar (single sample) or a 1-D sequence/tensor of
     length B.  The well-mixed limit (1 x 1 x 1) and the full 3D vessel use
@@ -51,17 +50,15 @@ def uniform(grid_cfg, N1=0.01, N2=0.01, N3=0.01, N4=0.01, L=0.0,
 
     Args:
         grid_cfg: ``GridConfig`` instance.
-        N1..N4, L, R1..R4, T1..T4, F1..F4: per-channel concentrations.
-            Toxins and byproducts default to zero (no warfare, no metabolic
-            history at t=0).
+        N1..N4, L, R1..R4, T1..T4: per-channel concentrations.  Toxins
+            default to zero (no warfare at t=0).
         mask: optional fluid mask, ``[Nz, Ny, Nx]`` or
             ``[1, 1, Nz, Ny, Nx]`` (1 = fluid, 0 = wall).  When given, wall
             cells are zeroed in the returned IC.
         device, dtype: torch placement.
     """
     Nz, Ny, Nx = grid_cfg.Nz, grid_cfg.Ny, grid_cfg.Nx
-    values = [N1, N2, N3, N4, L, R1, R2, R3, R4, T1, T2, T3, T4,
-              F1, F2, F3, F4]
+    values = [N1, N2, N3, N4, L, R1, R2, R3, R4, T1, T2, T3, T4]
     B = _infer_batch_size(values)
 
     state = torch.zeros(B, N_CHANNELS, Nz, Ny, Nx, device=device, dtype=dtype)
@@ -83,7 +80,6 @@ def uniform(grid_cfg, N1=0.01, N2=0.01, N3=0.01, N4=0.01, L=0.0,
 def octant(grid_cfg, N1=0.01, N2=0.01, N3=0.01, N4=0.01, L=0.0,
            R1=2.0, R2=2.0, R3=2.0, R4=2.0,
            T1=0.0, T2=0.0, T3=0.0, T4=0.0,
-           F1=0.0, F2=0.0, F3=0.0, F4=0.0,
            octant=(1, 1, 1),
            mask=None, device='cpu', dtype=torch.float64):
     """Initial condition concentrated in a single octant of the vessel.
@@ -94,16 +90,15 @@ def octant(grid_cfg, N1=0.01, N2=0.01, N3=0.01, N4=0.01, L=0.0,
 
     Args:
         grid_cfg: ``GridConfig`` instance.
-        N1..N4, L, R1..R4, T1..T4, F1..F4: per-channel concentrations inside
-            the octant.
+        N1..N4, L, R1..R4, T1..T4: per-channel concentrations inside the
+            octant.
         octant: 3-tuple of +-1 selecting (x_sign, y_sign, z_sign) relative to
             the vessel centre ``(Lx/2, Ly/2, Lz/2)``.  Default ``(+1, +1, +1)``.
         mask: optional fluid mask, ``[Nz, Ny, Nx]`` or ``[1, 1, Nz, Ny, Nx]``.
         device, dtype: torch placement.
     """
     Nz, Ny, Nx = grid_cfg.Nz, grid_cfg.Ny, grid_cfg.Nx
-    values = [N1, N2, N3, N4, L, R1, R2, R3, R4, T1, T2, T3, T4,
-              F1, F2, F3, F4]
+    values = [N1, N2, N3, N4, L, R1, R2, R3, R4, T1, T2, T3, T4]
     B = _infer_batch_size(values)
 
     state = torch.zeros(B, N_CHANNELS, Nz, Ny, Nx, device=device, dtype=dtype)

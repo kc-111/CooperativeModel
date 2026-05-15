@@ -5,7 +5,7 @@ the closed cylindrical reactor (no inlet, no outlet — a sealed batch
 fermentation).  The flow field is loaded from ``flow_cache.h5``
 produced once by ``scripts/solve_flow.py``.
 
-Channels: [N1..N4, L, R1..R4, T1..T4, F1..F4].
+Channels: [N1..N4, L, R1..R4, T1..T4].
 
 Usage:
     python scripts/solve_flow.py --out flow_cache.h5     # once
@@ -33,7 +33,6 @@ CANDIDATES = [
     # ('D  pair P_4 (N4)',  S_HI,  S_LO,  S_LO,  S_HI),
 ]
 samples = [[N0, N0, N0, N0, 0.0, R1, R2, R3, R4,
-            0.0, 0.0, 0.0, 0.0,
             0.0, 0.0, 0.0, 0.0]
            for (_, R1, R2, R3, R4) in CANDIDATES]
 

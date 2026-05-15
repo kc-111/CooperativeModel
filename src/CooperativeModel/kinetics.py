@@ -5,14 +5,13 @@ consumer-resource model (Tilman 1980; Marsland et al. 2019; Goyal & Maslov
 2018) on a cyclic 4-cycle of species and essential resources.  The model is
 run in **batch** mode — no chemostat dilution and no external supply terms
 in the dynamics; the BO control vector enters only as the initial resource
-concentrations.  Each species secretes a species-specific metabolic
-byproduct (separate chemical pool from the primary resources) and a
-species-specific toxin term selects against the all-max corner.
+concentrations.  A species-specific toxin term selects against the all-max
+corner.
 
-Variables (17 channels)::
+Variables (13 channels)::
 
-    [N1..N4,  L,  R1..R4,    T1..T4,                F1..F4]
-     species  obj  resources  per-species toxins   per-species byproducts
+    [N1..N4,  L,  R1..R4,    T1..T4]
+     species  obj  resources  per-species toxins
 
 Cyclic pairing (1-indexed in the comments, 0-indexed in code)::
 
@@ -22,14 +21,6 @@ Each species i requires *both* resources in P_i and is Liebig-limited by
 whichever is in shortest supply::
 
     g_i(R) = mu_i * min_{j in P_i}  R_j / (K + R_j)
-
-Byproduct secretion: each species i secretes its own metabolic byproduct
-F_i (chemically distinct from the primary resources R_j) at a rate
-proportional to its **total resource uptake flux**::
-
-    uptake_i  =  2 * c_i * g_i * N_i           (two paired resources, each
-                                                 consumed at  c_i * g_i * N_i)
-    dF_i/dt   =  sigma * uptake_i
 
 Toxins (bacteriocin-style): each species secretes its own toxin at a rate
 tied to its nutrient-uptake flux, the toxin decays first-order, and every
@@ -52,13 +43,6 @@ Batch ODEs::
     dL/dt   = sum_i  Y_i * g_i * N_i
     dR_j/dt = - sum_{i : j in P_i}  c_i * g_i * N_i
     dT_i/dt = beta * g_i * N_i  -  gamma * T_i
-    dF_i/dt = sigma * 2 * c_i * g_i * N_i
-
-Note that there is no cross-secretion term in dR_j/dt — byproducts live in
-their own pool (F_i), distinct from the primary resources, so the primary
-resource pool is consumed only.  The F_i pool is a tracked metabolic
-observable; it accumulates with uptake and does not feed back into growth
-in the current formulation.
 
 Why four local optima of L(R_init) emerge intuitively from the equations:
 
@@ -75,7 +59,7 @@ Why four local optima of L(R_init) emerge intuitively from the equations:
      a single-pair corner.  This removes the all-max corner as the global
      optimum and leaves the four pair-corners as the local maxima.
 
-All operations are vectorised over the spatial grid [B, 17, Nz, Ny, Nx].
+All operations are vectorised over the spatial grid [B, 13, Nz, Ny, Nx].
 """
 
 import torch
@@ -85,12 +69,12 @@ def compute_reaction_rates(state, params):
     """Compute local reaction rates at every grid point.
 
     Args:
-        state: ``[B, 17, ...]`` tensor with channel order
-            ``[N1..N4, L, R1..R4, T1..T4, F1..F4]``.
+        state: ``[B, 13, ...]`` tensor with channel order
+            ``[N1..N4, L, R1..R4, T1..T4]``.
         params: dict produced by ``ModelParameters.to_tensors()``.
 
     Returns:
-        ``[B, 17, ...]`` tensor of d(state)/dt from reactions only.
+        ``[B, 13, ...]`` tensor of d(state)/dt from reactions only.
     """
     # Intermediate RK stages can produce small negative concentrations that
     # would feed back into the rate laws; clamp to the physical orthant.
@@ -99,13 +83,11 @@ def compute_reaction_rates(state, params):
     N = state[:, 0:4]      # [B, 4, ...]   biomass per species
     R = state[:, 5:9]      # [B, 4, ...]   primary resource concentrations
     T = state[:, 9:13]     # [B, 4, ...]   per-species toxin concentrations
-    # F (state[:, 13:17]) is produce-only — no rate term reads from it.
 
     mu    = params['mu']     # [1, 4, 1, 1, 1]  per-species max growth rate
     K     = params['K']      # scalar           Monod half-saturation
     c     = params['c']      # [1, 4, 1, 1, 1]  per-species stoichiometric coefficient
     Y     = params['Y']      # [1, 4, 1, 1, 1]  per-species lactate yield
-    sigma = params['sigma']  # scalar           byproduct yield per unit uptake
     beta  = params['beta']   # scalar           toxin production / growth flux
     gamma = params['gamma']  # scalar           toxin first-order decay rate
     delta = params['delta']  # scalar           toxin kill coefficient (linear in T_other)
@@ -154,20 +136,10 @@ def compute_reaction_rates(state, params):
     # ---- Toxin dynamics: production tied to growth flux, decay first-order
     dT = beta * g * N - gamma * T
 
-    # ---- Byproduct secretion: production tied to *total uptake flux* --------
-    # Each species i takes up c_i * g_i * N_i from each of its two paired
-    # resources, so its total resource-uptake flux is 2 * c_i * g_i * N_i.
-    # The byproduct F_i (chemically distinct from R_j) accumulates at a
-    # fraction sigma of this uptake.  Tying secretion to uptake (rather than
-    # growth) means a species at high stoichiometric cost (large c_i) emits
-    # proportionally more byproduct per unit biomass produced.
-    dF = sigma * 2.0 * flux                         # [B, 4, ...]
-
     # ---- Assemble rates -----------------------------------------------------
     rates = torch.zeros_like(state)
     rates[:, 0:4] = dN
     rates[:, 4:5] = dL
     rates[:, 5:9] = dR
     rates[:, 9:13] = dT
-    rates[:, 13:17] = dF
     return rates
