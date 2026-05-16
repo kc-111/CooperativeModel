@@ -229,8 +229,9 @@ The model carries 13 channels at every fluid voxel:
 
 ### 3.2  Local kinetics (`compute_reaction_rates`)
 
-A textbook 4-species Liebig consumer-resource model (Tilman 1980) on a
-**cyclic 4-cycle** of species and essential resources.  Pairing is
+A textbook 4-species Liebig consumer-resource model (Tilman 1980;
+Marsland et al. 2019; Goyal & Maslov 2018) on a **cyclic 4-cycle** of
+species and essential resources.  Pairing is
 
     P₁ = {R₁, R₂},  P₂ = {R₂, R₃},  P₃ = {R₃, R₄},  P₄ = {R₄, R₁}
 
@@ -238,43 +239,87 @@ so each resource is essential to exactly two species and each species is
 Liebig-limited by whichever of its two paired resources is in shortest
 supply:
 
-    g_i(R) = μ_i · min_{j ∈ P_i}  R_j / (K + R_j)
+    Liebig_i(R) = min_{j ∈ P_i}  R_j / (K + R_j)
 
-**Species-specific toxins** (bacteriocin-style; Riley & Wertz 2002;
-Czárán et al. 2002; Kerr et al. 2002): each species secretes its own
-toxin at a rate tied to its nutrient-uptake flux, the toxin decays
-first-order, and every *other* species suffers a linear death term
-proportional to the toxins not its own.  A species is **immune to its
-own toxin** (T_i is excluded from the cross-toxin pool seen by N_i):
+On top of Liebig limitation, two **parallel Hill-form inhibition
+factors** multiply the per-species growth rate.  Both act on *growth*
+(not as cell-death terms): an inhibited species simply does not grow, so
+it consumes no resource and produces no L.  This avoids the spurious
+"transient growth then die" L-leak that any linear death term would
+introduce.
+
+**1. Resource-mediated (anti-nutrient) Hill inhibition.**  Each species
+is repressed by the *sum* of its two **non-paired** resources on the
+cycle:
+
+    poison_i  =  R_{(i+2) mod 4}  +  R_{(i+3) mod 4}
+    inh_R,i   =  K^{h_R} / (K^{h_R} + poison_i^{h_R})
+
+Summing both non-paired resources (rather than only the antipodal one)
+collapses the otherwise-flat "extra resource" plateau in `L(R_init)`:
+at a three-sugar configuration (e.g. R₁=R₂=R₃ HI, R₄ LO) the
+would-be grower N₂ has one of its non-paired resources HI, so its
+inh_R drops.  Only the pure pair corners P_i — both paired R's HI,
+both non-paired R's LO — leave a species fully un-poisoned.
+Biology: end-product / pH / undissociated organic-acid stress,
+allelopathic secondary metabolite, or differential ion susceptibility.
+
+**2. Toxin-mediated Hill inhibition** (bacteriocin-style; Riley & Wertz
+2002; Czárán et al. 2002; Kerr et al. 2002).  Each species secretes its
+own toxin T_i at a rate proportional to its growth flux, decays
+first-order, and is **immune to its own toxin** (T_i is excluded from
+the cross-toxin pool seen by N_i):
 
     T_other,i  =  Σ_{j ≠ i} T_j  =  T_tot − T_i
-    death_i    =  δ · T_other,i · N_i
+    inh_T,i    =  K_T^{h_T} / (K_T^{h_T} + T_other,i^{h_T})
     dT_i/dt    =  β · g_i · N_i  −  γ · T_i
 
-The toxin term **removes the all-max corner** of the resource initial
-condition box as a viable global optimum.  At a single-pair corner
-(e.g., R₁, R₂ high; R₃, R₄ low) only one species grows, produces only its
-own toxin, and incurs zero kill on itself.  At the all-max corner all
-four species grow and each is suppressed by the three cross-toxins,
-collapsing total biomass and the L objective.  Linearity in T_other is
-deliberate: a saturating (Hill) death term cannot overcome the carbon
-stoichiometry advantage of the all-max corner under unconstrained
-resource budgets, while a linear term scales with the cross-toxin pool
-and suppresses all-max regardless of the budget.
+The toxin channel closes the "depletion cascade" loophole that pure
+R-mediated inhibition leaves open: once the dominant species at a pair
+corner has consumed its paired resources, its R-poison on its
+competitors also drops, which would otherwise re-enable a late-phase
+wake-up of a suppressed species.  Because T_i is produced linearly in
+growth flux but decays slowly (γ small relative to growth time scale),
+the inhibitor *persists* after the producer's paired resources are gone
+and continues to suppress the cascade.
 
-Yield heterogeneity (`Y = [0.98, 1.02, 1.01, 0.99]`) breaks the
+**Net specific growth rate** (multiplicative composition of Liebig,
+R-Hill, and T-Hill):
+
+    g_i  =  μ_i · inh_R,i · inh_T,i · Liebig_i(R)
+
+Yield heterogeneity (`Y = [0.995, 1.001, 1.005, 0.999]`) breaks the
 exact cyclic degeneracy across the four pair corners without changing
-the qualitative topology.
+the qualitative topology — the four corners come out as
+distinguishable but tightly-clustered (≲ 1 %) optima rather than
+exactly equal plateaus.
 
-The full batch ODE system at a voxel is
+**The full batch ODE system at a voxel:**
 
-    dN_i/dt  =  g_i · N_i  −  δ · T_other,i · N_i
+    dN_i/dt  =  g_i · N_i
     dL/dt    =  Σ_i  Y_i · g_i · N_i
     dR_j/dt  =  − Σ_{i : j ∈ P_i}  c_i · g_i · N_i
     dT_i/dt  =  β · g_i · N_i  −  γ · T_i
 
-All operations are vectorised over the spatial grid
-`[B, 13, Nz, Ny, Nx]`.
+Symmetric default parameters: `μ = c = [1, 1, 1, 1]`, `K = K_T = 0.5`,
+`h_R = h_T = 4`, `β = 1`, `γ = 0.1`.  All operations are vectorised
+over the spatial grid `[B, 13, Nz, Ny, Nx]`.
+
+**Why four local optima of `L(R_init)` emerge from these equations:**
+
+1. Liebig growth requires *both* of a species' paired resources, so
+   setting either paired resource low kills that species' growth.
+2. At a pair corner P_i (paired resources HI, both non-paired resources
+   LO) only species i grows; the R-Hill suppresses every other species
+   whose poison sum includes one of i's HI paired resources, and Liebig
+   limitation kills the two cycle-neighbours that lack one of their
+   paired R's.
+3. The toxin T_i produced by species i persists via slow first-order
+   decay and suppresses any competitor that would otherwise wake up
+   once species i has consumed its paired resources.
+4. The all-max corner has every species' poison sum HI, so every
+   species' inh_R is small; total L is heavily suppressed and the
+   all-max corner is not the global optimum.
 
 ### 3.3  Transport equations
 
@@ -393,8 +438,23 @@ the spatial code.
 * **Czárán, T. L., Hoekstra, R. F. & Pagie, L.** (2002). *Chemical
   warfare between microbes promotes biodiversity.*  Proceedings of the
   National Academy of Sciences **99**(2), 786–790.  Mathematical model
-  of mutually-antagonistic strains via bacteriocin-style toxins —
-  source for the linear cross-killing term `δ · T_other · N`.
+  of mutually-antagonistic strains via bacteriocin-style toxins.  We
+  adopt the species-specific toxin + self-immunity structure but
+  inhibit *growth* (Hill on `T_other`) rather than apply a linear
+  cross-killing death term, so that an inhibited species does not leak
+  L during transient growth.
+
+* **Marsland, R. III, Cui, W., Goldford, J., Sanchez, A., Korolev, K. &
+  Mehta, P.** (2019). *Available energy fluxes drive a transition in
+  the diversity, stability, and functional structure of microbial
+  communities.*  PLOS Computational Biology **15**(2), e1006793.
+  General consumer-resource framework on cyclic / sparse resource
+  graphs, which the present pairing structure specialises.
+
+* **Goyal, A. & Maslov, S.** (2018). *Diversity, stability, and
+  reproducibility in stochastically assembled microbial ecosystems.*
+  Physical Review Letters **120**(15), 158102.  Stability properties
+  of consumer-resource models on cyclic pairings.
 
 * **Kerr, B., Riley, M. A., Feldman, M. W. & Bohannan, B. J. M.**
   (2002). *Local dispersal promotes biodiversity in a real-life game of

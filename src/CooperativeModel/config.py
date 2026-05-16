@@ -26,37 +26,52 @@ class ModelParameters:
     # Per-species maximum growth rates [time^-1]
     mu: list = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0])
 
-    # Monod half-saturation constant on each resource.  Scalar (not
-    # per-species) for the symmetric base case: ``g_i = mu_i * min_{j in P_i}
-    # R_j / (K + R_j)``.
+    # Monod half-saturation on each resource.  Scalar (not per-species)
+    # for the symmetric base case: ``Liebig_i = min_{j in P_i} R_j / (K + R_j)``.
+    # K also serves as the Hill K for the R-poison inhibition term, so
+    # the natural scale that separates LO from HI is shared between
+    # uptake and inhibition.
     K: float = 0.5
+
+    # Hill exponent for the resource-poison inhibition term.  Each
+    # species i is repressed by ``R_{(i+2) mod 4}`` via
+    # ``inh_R = K^h_R / (K^h_R + R_poison^h_R)``.  h_R = 4 gives a sharp
+    # switch at the K scale.
+    h_R: float = 4.0
 
     # Per-species stoichiometric coefficient: each species i consumes
     # ``c_i * g_i * N_i`` from each of its two paired resources.
     c: list = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0])
 
-    # Per-species lactate yield: dL/dt = sum_i Y_i * g_i * N_i.
+    # Per-species lactate yield: dL/dt = sum_i Y_i * g_i * N_i.  Slight
+    # per-species asymmetry breaks degeneracy between the four pair
+    # corners so the optimiser does not see four exactly-equal optima.
     Y: list = field(default_factory=lambda: [0.995, 1.001, 1.005, 0.999])
 
-    # Toxin production rate per unit nutrient-uptake flux: dT_i/dt has a
-    # source term ``beta * g_i * N_i``.  Each species secretes its own
-    # species-specific toxin and is immune to it.
+    # Toxin production per unit growth flux: ``dT_i/dt`` has a source
+    # term ``beta * g_i * N_i``.  Tying production to growth (not just
+    # biomass) means a poisoned / Liebig-starved species produces no
+    # toxin, so the toxin pool reflects which species are *actually*
+    # active, not just present.
     beta: float = 1.0
 
     # First-order toxin decay rate [time^-1].  Slow clearance lets toxin
-    # pools build up during co-existence so the linear death term has time
-    # to bite at any coexistence point (all-max **and** interior).
+    # pools persist after the producing species' paired resources are
+    # depleted, which is what closes the "depletion cascade" channel.
     gamma: float = 0.1
 
-    # Linear toxin kill coefficient.  Each species i loses biomass at
-    # ``delta * T_other * N_i``.  Sized so that multi-species partial
-    # growth on intermediate R is killed harder than single-species
-    # growth at a pair corner — with the now-tight Y the four pair
-    # corners are nearly degenerate in L and any interior coexistence
-    # point would otherwise beat them by stacking four partial-growth
-    # contributions.  A strong linear kill restores the corner-as-optimum
-    # topology.
-    delta: float = 10.0
+    # Hill K for toxin inhibition.  ``inh_T = K_T^h_T / (K_T^h_T +
+    # T_other^h_T)`` where ``T_other = T_tot - T_i``.  With beta = 1.0,
+    # gamma = 0.1 and mature biomass ~ 1, the steady toxin pool is on
+    # the order 1-10, so K_T = 0.5 puts the inhibition threshold well
+    # below the active-species toxin level (suppression is strong) but
+    # safely above the initial T = 0 (no spurious self-inhibition at
+    # t = 0).
+    K_T: float = 0.5
+
+    # Hill exponent for toxin inhibition.  h_T = 4 matches h_R for a
+    # sharp on/off transition at the K_T scale.
+    h_T: float = 4.0
 
     def to_tensors(self, device='cpu', dtype=torch.float64):
         """Convert parameters to tensors shaped for broadcasting over
@@ -67,11 +82,13 @@ class ModelParameters:
         return {
             'mu': _t(self.mu),
             'K': self.K,
+            'h_R': self.h_R,
             'c': _t(self.c),
             'Y': _t(self.Y),
             'beta': self.beta,
             'gamma': self.gamma,
-            'delta': self.delta,
+            'K_T': self.K_T,
+            'h_T': self.h_T,
         }
 
 

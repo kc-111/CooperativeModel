@@ -50,8 +50,7 @@ def uniform(grid_cfg, N1=0.01, N2=0.01, N3=0.01, N4=0.01, L=0.0,
 
     Args:
         grid_cfg: ``GridConfig`` instance.
-        N1..N4, L, R1..R4, T1..T4: per-channel concentrations.  Toxins
-            default to zero (no warfare at t=0).
+        N1..N4, L, R1..R4, T1..T4: per-channel concentrations.
         mask: optional fluid mask, ``[Nz, Ny, Nx]`` or
             ``[1, 1, Nz, Ny, Nx]`` (1 = fluid, 0 = wall).  When given, wall
             cells are zeroed in the returned IC.
@@ -90,8 +89,7 @@ def octant(grid_cfg, N1=0.01, N2=0.01, N3=0.01, N4=0.01, L=0.0,
 
     Args:
         grid_cfg: ``GridConfig`` instance.
-        N1..N4, L, R1..R4, T1..T4: per-channel concentrations inside the
-            octant.
+        N1..N4, L, R1..R4, T1..T4: per-channel concentrations inside the octant.
         octant: 3-tuple of +-1 selecting (x_sign, y_sign, z_sign) relative to
             the vessel centre ``(Lx/2, Ly/2, Lz/2)``.  Default ``(+1, +1, +1)``.
         mask: optional fluid mask, ``[Nz, Ny, Nx]`` or ``[1, 1, Nz, Ny, Nx]``.

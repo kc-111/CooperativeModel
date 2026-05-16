@@ -6,8 +6,8 @@ The PDE system for each species y_k is
 
 State tensor shape convention:
 
-    Internal :  [B, 13, Nz, Ny, Nx]   (batch, channels, depth, height, width)
-    Solver   :  [B, 13 * Nz * Ny * Nx] (flat vector for Tsit5)
+    Internal :  [B, 13, Nz, Ny, Nx]    (batch, channels, depth, height, width)
+    Solver   :  [B, 13 * Nz * Ny * Nx]  (flat vector for Tsit5)
 
 Channels: ``[N1..N4, L, R1..R4, T1..T4]``.  The velocity field is
 treated as fixed (cached from Stage 1); the well-mixed limit is recovered

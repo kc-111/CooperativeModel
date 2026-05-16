@@ -265,8 +265,7 @@ class Simulator:
         N1, N2, N3, N4, L, R1, R2, R3, R4, T1, T2, T3, T4:
             per-channel initial concentrations (uniform over fluid cells).
             Each can be a scalar or a 1-D sequence/tensor of length B
-            (multi-sample run).  Toxins default to zero (no warfare at
-            t=0).
+            (multi-sample run).
         samples: optional ``[B, 13]`` tensor (or nested list) of full
             initial conditions; overrides the per-channel arguments.
         t_final: integration time [hours].  Default 24.
@@ -294,7 +293,7 @@ class Simulator:
 
         r = Simulator(samples=[[0.01, 0.01, 0.01, 0.01, 0.0,
                                  2, 2, 0.05, 0.05,
-                                 0, 0, 0, 0]],
+                                 0.0, 0.0, 0.0, 0.0]],
                       grid_shape=(32, 32, 32),
                       flow_cache_path='flow_cache.h5',
                       t_final=24.0).run()
@@ -312,8 +311,7 @@ class Simulator:
                  ic_octant=(1, 1, 1),
                  device='cpu'):
         self._ic = self._normalize_ic(
-            N1, N2, N3, N4, L, R1, R2, R3, R4,
-            T1, T2, T3, T4, samples,
+            N1, N2, N3, N4, L, R1, R2, R3, R4, T1, T2, T3, T4, samples,
         )
         self.t_final = t_final
         self.n_output = n_output
@@ -333,8 +331,7 @@ class Simulator:
         self.device = device
 
     @staticmethod
-    def _normalize_ic(N1, N2, N3, N4, L, R1, R2, R3, R4,
-                     T1, T2, T3, T4, samples):
+    def _normalize_ic(N1, N2, N3, N4, L, R1, R2, R3, R4, T1, T2, T3, T4, samples):
         """Convert IC specification to a ``[B, 13]`` CPU float64 tensor."""
         if samples is not None:
             s = torch.as_tensor(samples).to(dtype=torch.float64, device='cpu')

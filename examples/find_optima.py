@@ -2,7 +2,7 @@
 
 Runs in the **well-mixed limit** (grid_shape=(1, 1, 1), flow_cache_path=None,
 device='cpu'): the optimisation needs hundreds–thousands of objective
-evaluations and the 32^3 PDE costs ~1 s/sample on GPU, while the 9-ODE
+evaluations and the 32^3 PDE costs ~1 s/sample on GPU, while the 13-ODE
 well-mixed system costs ~10 ms/sample on CPU.
 
 Pipeline:
@@ -37,7 +37,7 @@ BOUNDS = [(R_MIN, R_MAX)] * 4
 # bounds, so near-corner L-BFGS-B refinements collapse into one optimum
 # per corner while keeping the four corners distinguishable.
 EPSILON = 1.0
-N_RANDOM = 400
+N_RANDOM = 1000
 N_TOP = 30
 DEVICE = 'cpu'
 SEED = 42
@@ -47,7 +47,7 @@ def eval_batch(resources):
     """Vectorised L_final for resources of shape [B, 4]."""
     resources = np.asarray(resources, dtype=float).reshape(-1, 4)
     B = len(resources)
-    # IC: [N1..N4, L, R1..R4, T1..T4]
+    # IC: [N1..N4, L, R1..R4, T1..T4]  (toxins start at zero)
     samples = np.zeros((B, 13))
     samples[:, 0] = N0
     samples[:, 1] = N0
@@ -55,7 +55,6 @@ def eval_batch(resources):
     samples[:, 3] = N0
     samples[:, 4] = L0
     samples[:, 5:9] = resources
-    # T1..T4 (indices 9..12) stay at zero — no warfare at t=0.
     r = Simulator(
         samples=samples.tolist(),
         t_final=T_FINAL, grid_shape=(1, 1, 1),
@@ -107,7 +106,7 @@ def main():
         res = minimize(
             neg_L, x0=x0, method='L-BFGS-B',
             bounds=BOUNDS,
-            options={'maxiter': 1000, 'ftol': 1e-9, 'gtol': 1e-6},
+            options={'maxiter': 2000, 'ftol': 1e-9, 'gtol': 1e-6},
         )
         refined.append((res.x, -res.fun))
     print(f'  refinement: {time.time() - t0:.1f}s')

@@ -1,8 +1,10 @@
 """Example: well-mixed (0D-equivalent) bioreactor — lactic acid comparison.
 
 Closed batch reactor with ``grid_shape=(1, 1, 1)``, no diffusion, no
-advection (``flow_cache_path=None``).  The system reduces to 9 coupled
-ODEs (N1..N4, L, R1..R4) in the 4-species Liebig consumer-resource model.
+advection (``flow_cache_path=None``).  The system reduces to 13 coupled
+ODEs (N1..N4, L, R1..R4, T1..T4) in the 4-species Liebig consumer-resource
+model (with per-species toxin pools T_i for the bacteriocin-style
+inhibition channel).
 
 Each of the four "pair corners" in the (R1, R2, R3, R4) initial space
 gives a local maximum of L(t_final) — only the species whose pair P_i is
@@ -34,10 +36,9 @@ CANDIDATES = [
     ('all-max (ref)',     1.0,   1.0,   1.0,   1.0),
 ]
 
-# IC layout: [N1..N4, L, R1..R4, T1..T4]
+# IC layout: [N1..N4, L, R1..R4, T1..T4]  (toxins start at zero)
 N0 = 0.01
-samples = [[N0, N0, N0, N0, 0.0, R1, R2, R3, R4,
-            0.0, 0.0, 0.0, 0.0]
+samples = [[N0, N0, N0, N0, 0.0, R1, R2, R3, R4, 0.0, 0.0, 0.0, 0.0]
            for (_, R1, R2, R3, R4) in CANDIDATES]
 
 start_time = time.time()

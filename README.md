@@ -1,8 +1,8 @@
 # CooperativeModel
 
-3D reaction-advection simulation of a two-strain cooperative microbial consortium (CoA + CoB) inside a cylindrical stirred tank, implemented in PyTorch.  Mixing is supplied entirely by chaotic advection from a non-axisymmetric impeller body force; there is no explicit (eddy / Fickian) diffusion operator.
+3D reaction-advection simulation of a 4-species Liebig consumer-resource consortium on a cyclic 4-cycle of essential resources, inside a cylindrical stirred tank, implemented in PyTorch.  Mixing is supplied entirely by chaotic advection from a non-axisymmetric impeller body force; there is no explicit (eddy / Fickian) diffusion operator.
 
-The package is organised as a **two-stage pipeline**: a steady incompressible Navier–Stokes solve over the cylinder produces a velocity field once and caches it to HDF5; species transport then integrates the cooperative kinetics on top of that fixed flow for every Bayesian-optimisation evaluation. The flow is held constant through the BO loop — concentrations evolve, the velocity field does not.
+The package is organised as a **two-stage pipeline**: a steady incompressible Navier–Stokes solve over the cylinder produces a velocity field once and caches it to HDF5; species transport then integrates the consumer-resource kinetics on top of that fixed flow for every Bayesian-optimisation evaluation. The flow is held constant through the BO loop — concentrations evolve, the velocity field does not.
 
 The architecture follows the **CFD-based compartment-model framing** of Delafosse et al. (2014, *Chemical Engineering Science* **106**, 76–85): each finite-volume cell acts as a compartment whose inter-compartment fluxes come from the resolved velocity field. The impeller is represented as a localised body force in the spirit of Pericleous & Patel (1987) and is **non-axisymmetric** (a single angular Gaussian "blade") so that the resulting Lagrangian streamlines are chaotic rather than purely toroidal.
 
@@ -24,133 +24,112 @@ python examples/example.py
 from CooperativeModel import Simulator
 
 # Stage 2 in code: the BO objective wraps Simulator.run() and never re-solves Stage 1.
+# IC channels: [N1..N4, L, R1..R4, T1..T4].  Pair P_1 = {R1, R2}: load R1, R2 high,
+# R3, R4 low; species N1 dominates and produces lactate.
 r = Simulator(
-    samples=[[0.05, 0.05, 0.0, 0.0, 25.0, 25.0, 25.0, 25.0]],
-    t_final=48.0, grid_shape=(32, 32, 32),
+    samples=[[0.01, 0.01, 0.01, 0.01, 0.0,
+              2.0, 2.0, 0.05, 0.05,
+              0.0, 0.0, 0.0, 0.0]],
+    t_final=24.0, grid_shape=(32, 32, 32),
     flow_cache_path='flow_cache.h5',
     ic_mode='uniform',
     device='cuda',
 ).run()
-print(f'L={r.L_final:.2f}, Sn={r.Sn_final:.2f}')
+print(f'L={r.L_final:.4f}')
 r.gif('sample0.gif')              # mid-z slice, wall boundary contoured
 
-# Well-mixed limit: 1x1x1 grid, no flow → the 8-ODE system.
-r = Simulator(samples=[[0.05, 0.05, 0, 0, 25, 25, 25, 25]],
+# Well-mixed limit: 1x1x1 grid, no flow → the 13-ODE system.
+r = Simulator(samples=[[0.01, 0.01, 0.01, 0.01, 0.0,
+                        2.0, 2.0, 0.05, 0.05,
+                        0.0, 0.0, 0.0, 0.0]],
               grid_shape=(1, 1, 1), flow_cache_path=None,
-              t_final=72.0).run()
+              t_final=24.0).run()
 ```
 
 See [`examples/example.py`](examples/example.py) and [`examples/find_optima.py`](examples/find_optima.py) for the full runnable scripts.
 
 ## Model
 
-### State Variables
+### State Variables (13 channels)
 
 | Symbol | Channel | Description |
 |--------|---------|-------------|
-| $N_1$ | 0 | Population density of strain CoA |
-| $N_2$ | 1 | Population density of strain CoB |
-| $S_n$ | 2 | Nisin concentration |
-| $L$   | 3 | Lactic acid concentration |
-| $F_1$ | 4 | Glucose concentration |
-| $F_2$ | 5 | Fructose concentration |
-| $F_3$ | 6 | Sucrose concentration |
-| $F_4$ | 7 | Maltose concentration |
+| $N_1, N_2, N_3, N_4$ | 0–3 | Per-species biomass (4-cycle of consumers) |
+| $L$                  | 4   | Lactate-style scalar objective |
+| $R_1, R_2, R_3, R_4$ | 5–8 | Primary essential resources |
+| $T_1, T_2, T_3, T_4$ | 9–12 | Per-species (bacteriocin-style) toxins |
 
 ### Well-Mixed ODE (Local Reaction Kinetics)
 
-Each spatial cell evolves according to a cooperative-consortium ODE built on top of [Kong et al. (2018)]. The base structure (Monod growth + diauxic shift + nisin-cooperative production + nisin-protected death) is unchanged; five biological mechanisms have been added on top so that $L_{\text{final}}$ has *interior* optima in the four-sugar input space rather than the single trivial corner-loaded optimum of the original. These additions are listed together in [Mechanisms added on top of Kong et al.](#mechanisms-added-on-top-of-kong-et-al).
+A textbook 4-species Liebig consumer-resource model (Tilman 1980; Marsland et al. 2019; Goyal & Maslov 2018) on a **cyclic 4-cycle** of species and essential resources, layered with **two multiplicative Hill-form inhibitors** so that the four "pair corners" of the resource initial-condition box emerge as four clean local optima of $L_{\text{final}}$.
 
-The presentation below builds up named intermediates (growth rates, then totals, then production/death rate factors) so that the final ODE system on the right-hand side reads cleanly. The convention is that anything *boxed* on the left of an `:=` is a definition; the final ODE block at the bottom uses only those symbols.
+**Pairing.** Each species $i$ requires *both* resources in its pair $P_i$:
 
-**Step 1 — Per-sugar growth rates** (Haldane for CoA, Monod for CoB):
+$$P_1 = \{R_1, R_2\}, \quad P_2 = \{R_2, R_3\}, \quad P_3 = \{R_3, R_4\}, \quad P_4 = \{R_4, R_1\}$$
 
-$$g_{1,i} \;:=\; \mu_{1,i} \, \frac{F_i}{K_{1,i} + F_i + F_i^{2}/K_{\text{inh},i}} \qquad g_{2,i} \;:=\; \mu_{2,i} \, \frac{F_i}{K_{2,i} + F_i}$$
+so each resource is essential to exactly two species and each species is Liebig-limited by whichever paired resource is in shortest supply:
 
-The CoA Haldane form has a maximum at $F_i^{*} = \sqrt{K_{1,i} K_{\text{inh},i}}$ — past this concentration the same sugar that fed CoA starts to inhibit it. With the values in Table 1 the per-sugar peaks sit around $(F_1^{*},F_2^{*},F_3^{*},F_4^{*}) \approx (75, 50, 30, 60)$ g/L, well inside the operating box, which is what makes the lactic-acid landscape multimodal in $(F_1,F_2,F_3,F_4)$.
+$$\text{Liebig}_i(\mathbf{R}) \;:=\; \min_{j \in P_i} \frac{R_j}{K + R_j}$$
 
-**Step 2 — Diauxic weighting and totals.** CoA preferentially consumes whichever sugar gives it the fastest individual growth rate, with sharpness $n$:
+**Inhibition 1 — Resource-mediated (anti-nutrient) Hill.** Each species $i$ is repressed by the **sum of its two non-paired resources** on the cycle:
 
-$$\beta_{1,i} \;:=\; \frac{g_{1,i}^{\,n}}{\sum_{j} g_{1,j}^{\,n}} \qquad \tilde g_{1,\text{tot}} \;:=\; \sum_{i} \beta_{1,i} \, g_{1,i} \qquad g_{2,\text{tot}} \;:=\; \tfrac{1}{4} \sum_{i} g_{2,i}$$
+$$\text{poison}_i \;:=\; R_{(i+2)\bmod 4} + R_{(i+3)\bmod 4} \qquad \text{inh}^R_i \;:=\; \frac{K^{h_R}}{K^{h_R} + \text{poison}_i^{h_R}}$$
 
-**Step 3 — Lactate product inhibition on CoA total growth.** Accumulated lactate slows CoA but not CoB:
+Using *both* non-paired resources (not only the antipodal one) collapses the otherwise-flat "extra resource" plateau in $L(\mathbf{R}_{\text{init}})$: any three-sugar-HI configuration drives one of the would-be grower's non-paired resources HI, suppressing it. Only the four pure pair corners — paired R's HI, both non-paired R's LO — leave a species fully un-poisoned. Biology: end-product / pH / undissociated organic-acid stress, allelopathic secondary metabolite, or differential ion susceptibility.
 
-$$g_{1,\text{tot}} \;:=\; \frac{\tilde g_{1,\text{tot}}}{1 + (L/K_{p,L})^{h_L}}$$
+**Inhibition 2 — Toxin-mediated (bacteriocin-style) Hill.** Each species $i$ secretes its own toxin $T_i$ at a rate proportional to its growth flux, decays first-order, and is **immune to its own toxin** (the cross-toxin pool seen by $N_i$ excludes $T_i$):
 
-The unhatted $g_{1,\text{tot}}$ is what the rest of the equations use. Setting $K_{p,L}\to\infty$ recovers the original uninhibited $\tilde g_{1,\text{tot}}$.
+$$T_{\text{other},i} \;:=\; \textstyle\sum_{j \neq i} T_j \;=\; T_{\text{tot}} - T_i \qquad \text{inh}^T_i \;:=\; \frac{K_T^{h_T}}{K_T^{h_T} + T_{\text{other},i}^{h_T}}$$
 
-**Step 4 — Net death rate (split-death model).** Death is decomposed into a *microbial* component (bacteriocin-style, attenuated by nisin self-immunity) and a *chemical* component (per-sugar toxicity, NOT protected by nisin):
+$$\frac{dT_i}{dt} \;=\; \beta \, g_i \, N_i \;-\; \gamma \, T_i$$
 
-$$\text{Hill}(x) \;:=\; \frac{x^{h_{\text{tox}}}}{1 + x^{h_{\text{tox}}}} \qquad \tau \;:=\; c_{\text{tox}} \sum_{i} \text{Hill}\!\bigl(F_i / K_{\text{tox},i}\bigr)$$
+Slow first-order decay ($\gamma$ small relative to the growth time scale) makes $T_i$ **persist** after the producer's paired resources are gone, which closes the "depletion cascade" loophole: once the dominant species at a pair corner has consumed its paired resources, the R-poisons on its competitors also drop — without the persistent toxin term a suppressed species would otherwise wake up and leak L.
 
-$$\delta_1 \;:=\; d_{t_1} \cdot \!\left[\,\underbrace{\frac{1}{1 + k_s \, S_n}}_{\text{nisin-protected microbial death}} \;+\; \underbrace{\tau}_{\text{chemical (not nisin-protected)}}\right] \qquad \delta_2 \;:=\; d_{t_2} \cdot \!\left[\frac{1}{1 + k_s \, S_n} + \tau\right]$$
+**Crucially, both inhibition factors multiply the growth rate, not a death rate.** An inhibited species simply does not grow — it consumes no resource and produces no L. This avoids the spurious "transient growth then die" L-leak that any linear cell-death term would introduce, and is what makes the all-max corner cleanly *non-optimal* (every species fully poisoned, total $L$ small) rather than a partially-active bath.
 
-Two biological points:
+**Net specific growth rate** (Liebig × R-Hill × T-Hill, all multiplicative):
 
-1. **Per-sugar saturating Hill toxicity.** Each sugar contributes a separate Hill term `Hill(F_i / K_tox,i)` capped at 1, so the four sugars together contribute at most `4·c_tox` to the death-rate multiplier (vs. an unbounded sum in the linear form).  `h_tox > 1` makes the threshold sigmoidal — near-zero below `K_tox,i`, sharp rise above — which keeps moderate-F regions viable while still creating a clear "death zone" at high F.  LAB are sensitive to different sugars in different ways (Maillard / methylglyoxal for glucose, osmotic stress for sucrose, transporter overload for maltose), so the toxicity profile is *species-of-sugar* specific, not a function of $F_{\text{tot}}$.  This per-coordinate asymmetry is what places optima at non-uniform interior $F_i^{*}$ rather than along the diagonal.
+$$g_i \;:=\; \mu_i \,\cdot\, \text{inh}^R_i \,\cdot\, \text{inh}^T_i \,\cdot\, \text{Liebig}_i(\mathbf{R})$$
 
-2. **Why split-death** (microbial + chemical, rather than a single nisin-protected term). The producer-cell self-immunity machinery — the lipoprotein **NisI** (binds and sequesters nisin at the membrane, blocks pore formation) and the ABC exporter **NisFEG** (removes cell-associated nisin into the medium) — is *bacteriocin-specific*: it neutralises nisin, not generic physico-chemical stresses on the cell envelope and cytoplasm (Stein et al., *J. Biol. Chem.* 2003; AlKhatib et al., *PLoS ONE* 2014).  Putting the per-sugar toxicity inside the same `1/(1 + k_s S_n)` denominator as the microbial term would be saying "any amount of nisin protects against high glucose" — biologically wrong.  Operationally it also collapses the model: once nisin reaches `S_n ≈ 0.005` (with `k_s = 400` this gives `1/(1 + k_s S_n) ≈ 0.33`), the entire death term shrinks to near-zero and high-F runs simply consume all sugar with no penalty, making `L_final` monotone in `F_tot`.  Splitting keeps a chemical-death floor that scales with `F` and exposes the multimodal interior structure of the L-landscape.
+**Full batch ODE system** at a voxel:
 
-**Step 5 — Cooperative nisin production rate** (Kong base × four-sugar co-limitation × CCR):
+$$\frac{dN_i}{dt} = g_i \, N_i \qquad \frac{dL}{dt} = \sum_i Y_i \, g_i \, N_i$$
 
-$$P_m \;:=\; \underbrace{\alpha \, \frac{S_n + r_b}{k_p + S_n} \, F_{\text{tot}} \, \frac{N_1 \, N_2}{k_m + N_2}}_{\text{Kong et al. base}} \cdot \underbrace{\prod_{i} \frac{F_i}{K_{\text{coop}} + F_i}}_{\text{co-limitation}} \cdot \underbrace{\frac{1}{1 + (F_{\text{tot}}/K_{\text{ccr}})^{h_{\text{ccr}}}}}_{\text{CCR}}$$
+$$\frac{dR_j}{dt} = -\!\!\sum_{i \,:\, j \in P_i}\! c_i \, g_i \, N_i \qquad \frac{dT_i}{dt} = \beta \, g_i \, N_i - \gamma \, T_i$$
 
-with $F_{\text{tot}} = \sum_i F_i$. The two multiplicative factors are biologically motivated:
-
-- **Co-limitation** is the *interactive* (multiplicative / Mankin) form, used here for nisin biosynthetic flux rather than for biomass growth: the product is suppressed whenever *any* sugar goes to zero, pushing optima away from the lower bounds of every coordinate. This is the classical product-Monod form for **complementary, non-substitutable inputs** to a single biosynthetic pathway (Megee et al., *Biotechnol. Bioeng.* 1972; Bader, *Biotechnol. Bioeng.* 1978; reviewed in Kovárová-Kovar & Egli, *MMBR* 1998). Saito et al. (2008) categorise this as **Type I (independent) co-limitation** — distinct biochemical roles, all required. Justification for nisin: ribosomal synthesis of the 57-residue precursor, NisB/C-mediated dehydration and cyclisation of Ser/Thr/Cys, and NisT export are all ATP- and cofactor-intensive; sustained throughput requires balanced flux through glycolysis, TCA replenishment, and amino-acid biosynthesis. A diet of one sugar yields imbalanced flux and downregulates secondary metabolism in LAB. The strict Liebig minimum $\min_i F_i / (K_{\text{coop}} + F_i)$ would only track the single most-limiting sugar; the product instead lets all four limitations compound, which is the empirically better fit for complementary inputs (PNAS 2024 dynamic-colimitation framework).
-- **CCR** (carbon-catabolite repression) implements CcpA-mediated repression of secondary-metabolite biosynthesis at high carbohydrate load in LAB. It penalises *high* $F_{\text{tot}}$ and pushes optima away from the upper bounds.
-
-Combined with the per-sugar toxicity term in $\delta_j$, these break the "more sugar → more nisin → more bacteria → more $L$" monotonic chain; the result is a multimodal $L$ landscape with **30 distinct local maxima** under the well-mixed scan in `examples/find_optima.py` (eps = 2 separation, `t_final = 72 h`), the majority of which lie strictly inside the operating box.  The current top optimum is `F* ≈ (59.0, 84.9, 0.5, 85.3)` with `L_final ≈ 61.21`; #2 is at `(5.7, 80.1, 92.8, 77.2)` with `L_final ≈ 60.65`.  Each near-edge configuration drops one sugar near zero to escape that sugar's per-sugar toxicity term — `F_3 ≈ 0` is preferred because `K_tox,3 = 55` is the tightest threshold.
-
-**Step 6 — Final ODE system.** Using the symbols defined above:
-
-$$\frac{dN_1}{dt} = (g_{1,\text{tot}} - \delta_1) \, N_1 \qquad \frac{dN_2}{dt} = \tfrac{1}{\sigma} \, g_{2,\text{tot}} \, N_2 - \delta_2 \, N_2$$
-
-$$\frac{dS_n}{dt} = P_m - k_n \, S_n \qquad \frac{dL}{dt} = Y_L \, g_{1,\text{tot}} \, N_1$$
-
-$$\frac{dF_i}{dt} = -\frac{1}{\gamma_{1,i}} \, \beta_{1,i} \, g_{1,i} \, N_1 - \frac{1}{\sigma \, \gamma_{2,i}} \, g_{2,i} \, N_2 \qquad i \in \{1,2,3,4\}$$
+All operations are vectorised over the spatial grid $[B, 13, N_z, N_y, N_x]$ — the same `compute_reaction_rates` is reused in the well-mixed and 3D regimes since local kinetics is purely pointwise.
 
 ### Parameters (Table 1)
 
+Defaults in `ModelParameters` (see `src/CooperativeModel/config.py`):
+
 | Symbol | Description | Value |
 |--------|-------------|-------|
-| $\mu_{1,i}$ | Max growth rate of CoA on $F_i$ | $[0.53,\; 0.5,\; 0.6,\; 0.55]$ h$^{-1}$ |
-| $\mu_{2,i}$ | Max growth rate of CoB on $F_i$ | $[0.68,\; 0.64,\; 0.61,\; 0.7]$ h$^{-1}$ |
-| $d_{t_1},\; d_{t_2}$ | Max death rates | $0.39,\; 0.34$ h$^{-1}$ |
-| $\sigma$ | CoB growth scaling factor | $1.5$ |
-| $\alpha$ | Nisin production constant | $0.33$ |
-| $k_p$ | Nisin production saturation | $8.0$ |
-| $r_b$ | Nisin basal production rate | $0.060$ |
-| $k_n$ | Nisin degradation rate | $0.065$ h$^{-1}$ |
-| $k_s$ | Nisin death inhibition | $400$ |
-| $k_m$ | Nisin cooperative saturation | $0.014$ |
-| $K_{1,i}$ | Monod const. CoA | $[0.19,\; 0.2,\; 0.18,\; 0.17]$ |
-| $K_{2,i}$ | Monod const. CoB | $[0.72,\; 0.75,\; 0.65,\; 0.6]$ |
-| $K_{\text{inh},i}$ | Haldane inhibition const. CoA | $[3.0\!\times\!10^4,\; 1.25\!\times\!10^4,\; 5.0\!\times\!10^3,\; 2.1\!\times\!10^4]$ |
-| $\gamma_{1,i}$ | Yield const. CoA | $[0.6,\; 0.7,\; 0.72,\; 0.78]$ |
-| $\gamma_{2,i}$ | Yield const. CoB | $[0.575,\; 0.625,\; 0.6,\; 0.5]$ |
-| $Y_L$ | Lactic acid yield | $1.0$ |
-| $n$ | Diauxic shift sharpness | $2.0$ |
-| $K_{p,L},\; h_L$ | Lactate product inhibition (CoA growth) | $35,\; 2$ |
-| $c_{\text{tox}},\; K_{\text{tox},i},\; h_{\text{tox}}$ | Per-sugar toxicity (saturating Hill) | $0.4,\; [85, 75, 55, 80],\; 4$ |
-| $K_{\text{coop}}$ | Co-limitation Hill half-sat. (nisin) | $2.0$ |
-| $K_{\text{ccr}},\; h_{\text{ccr}}$ | Catabolite repression (nisin) | $300,\; 2$ |
+| $\mu_i$           | Per-species max growth rate                    | $[1, 1, 1, 1]$ h$^{-1}$ |
+| $K$               | Monod half-saturation (also R-Hill $K$)        | $0.5$ |
+| $h_R$             | Hill exponent for R-poison inhibition          | $4$ |
+| $c_i$             | Per-species stoichiometric uptake coefficient  | $[1, 1, 1, 1]$ |
+| $Y_i$             | Per-species lactate yield (asymmetry-breaker)  | $[0.995,\; 1.001,\; 1.005,\; 0.999]$ |
+| $\beta$           | Toxin production per growth flux                | $1.0$ |
+| $\gamma$          | Toxin first-order decay rate                    | $0.1$ h$^{-1}$ |
+| $K_T$             | Hill $K$ for toxin inhibition                   | $0.5$ |
+| $h_T$             | Hill exponent for toxin inhibition              | $4$ |
 
-Note: $k_s$ has been reduced from the original $1.2\!\times\!10^3$ to $400$ in this implementation. The original value places the survival/death boundary at very low $S_n$ which makes the protected/unprotected behaviour effectively bistable across the operating box, collapsing all candidate $L$-trajectories to a single broad plateau. Softening it to 400 moves that boundary into the interior and — combined with the additional kinetic mechanisms above — exposes the multimodal structure of $L_{\text{final}}$ in $(F_1,F_2,F_3,F_4)$.
+The symmetric base values $\mu_i, c_i = 1$ and $K = K_T$, $h_R = h_T$ give four equal-height pair-corner optima. Slight $Y$ heterogeneity breaks the exact cyclic degeneracy so the four optima are distinguishable but tightly clustered (within $\sim 1\%$ of each other).
 
-#### Mechanisms added on top of Kong et al.
+### Where the four local optima come from
 
-The base Kong et al. ODE has a single trivial optimum: max all four sugars. To make the model a useful test bed for spatial / multi-modal optimisation, five biologically-grounded effects are layered on top. Each is gated by a parameter that recovers the original model in a limit, so the additions are opt-in.
+`examples/find_optima.py` runs a batched landscape scan + greedy seeding + L-BFGS-B refinement over the well-mixed system and reports the distinct local optima of $L_{\text{final}}(R_1, R_2, R_3, R_4)$. With the current defaults the top four are exactly the four pair corners, with a **~36 % gap** to the next-best candidate:
 
-| # | Mechanism | Where it acts | Recover original by | Why it's there |
-|---|-----------|---------------|---------------------|----------------|
-| 1 | Haldane substrate inhibition (CoA) | $g_{1,i}$ growth | $K_{\text{inh},i} \to \infty$ | High sugar inhibits the same uptake it feeds — places per-sugar growth peaks at $\sqrt{K_{1,i}K_{\text{inh},i}}$ inside $(0,100)$. |
-| 2 | Lactic-acid product inhibition | $g_{1,\text{tot}}$ | $K_{p,L} \to \infty$ | Standard Luedeking-Piret-style end-product inhibition; couples all four sugars through a shared $L$ pool and breaks the uninhibited yield ceiling. |
-| 3 | Per-sugar specific toxicity | death rate $\delta_j$ | $c_{\text{tox}} \to 0$ | Different sugars damage LAB through different routes (Maillard / methylglyoxal for glucose, osmotic stress for sucrose, transporter overload for maltose). Each $K_{\text{tox},i}$ is independent, which breaks the $F_{\text{tot}}$ symmetry and shifts optima away from the equal-mix diagonal. |
-| 4 | Multiplicative co-limitation (nisin) | $P_m$ | $K_{\text{coop}} \to 0$ | Bacteriocin biosynthesis treats the four sugars as complementary, non-substitutable inputs to a single secondary-metabolite flux — the product $\prod_i F_i/(K_{\text{coop}}+F_i)$ of four Hill terms is bounded above by 1 and is suppressed whenever any sugar goes to zero. This is Saito et al. (2008) Type I co-limitation in the multiplicative / Mankin form (Megee 1972; Bader 1978), not metabolic cross-feeding between strains. Pushes optima away from the lower bounds. |
-| 5 | Carbon catabolite repression (nisin) | $P_m$ | $K_{\text{ccr}} \to \infty$ | CcpA-mediated repression of secondary-metabolite biosynthesis at high carbohydrate load. Penalises high $F_{\text{tot}}$ and pushes optima away from the upper bounds. |
+| # | $R_1$ | $R_2$ | $R_3$ | $R_4$ | $L_{\text{final}}$ | corner |
+|---|-------|-------|-------|-------|--------------------|--------|
+| 1 | 0.05  | 2.00  | 2.00  | 0.05  | 2.017              | $P_2$ (N2 grows) |
+| 2 | 0.05  | 0.05  | 2.00  | 2.00  | 2.015              | $P_3$ (N3 grows) |
+| 3 | 2.00  | 0.05  | 0.05  | 2.00  | 2.014              | $P_4$ (N4 grows) |
+| 4 | 2.00  | 2.00  | 0.05  | 0.05  | 2.003              | $P_1$ (N1 grows) |
+| 5 | 1.18  | 0.10  | 0.22  | 1.38  | 1.284              | — |
 
-(1) and (3) make the death + growth balance asymmetric across sugars; (2) couples sugars through $L$; (4) and (5) make the nisin-protection signal a non-monotone function of $F_{\text{tot}}$, peaked at moderate values. Together these break the single-optimum structure of the base model: the well-mixed scan in `examples/find_optima.py` finds **30 distinct local maxima** of $L_{\text{final}}(F_1,F_2,F_3,F_4)$ at $\varepsilon = 2$ separation, most of which lie strictly inside $(0,100)^4$.
+Mechanistically: at a pair corner $P_i$ both of species $i$'s paired resources are HI and both of its non-paired resources are LO. The R-Hill is therefore $\sim 1$, Liebig is $\sim 1$, and the toxin pool is dominated by $T_i$ which $N_i$ is immune to. Every other species has either a Liebig-killed pair (a paired R is LO) or an HI non-paired R that suppresses its R-Hill. Once $N_i$ is the only grower, persistent $T_i$ keeps the late-phase cascade closed and $N_i$ runs the paired resources down on its own.
 
 ### 3D Spatial Extension (PDE)
 
@@ -206,16 +185,17 @@ After the outer loop converges, a single **unpreconditioned CG pass** on `−lap
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `N1, N2` | 0.05 | Initial population densities (CoA, CoB) |
-| `Sn, L` | 0.0 | Initial nisin / lactic acid |
-| `F1, F2, F3, F4` | 25, 25, 25, 25 | Initial sugars (glucose, fructose, sucrose, maltose) |
-| `samples` | `None` | Optional `[B, 8]` IC tensor (overrides per-channel args) |
-| `t_final` | 72.0 | Integration time [hours] |
-| `n_output` | 145 | Number of output time points |
+| `N1, N2, N3, N4` | 0.01 | Initial per-species biomass |
+| `L` | 0.0 | Initial lactate-style objective |
+| `R1, R2, R3, R4` | 2.0 | Initial resource concentrations |
+| `T1, T2, T3, T4` | 0.0 | Initial per-species toxin concentrations |
+| `samples` | `None` | Optional `[B, 13]` IC tensor (overrides per-channel args; layout `[N1..N4, L, R1..R4, T1..T4]`) |
+| `t_final` | 24.0 | Integration time [hours] |
+| `n_output` | 49 | Number of output time points |
 | `grid_shape` | `(32, 32, 32)` | `(Nz, Ny, Nx)`. Use `(1, 1, 1)` for the well-mixed limit. |
 | `flow_cache_path` | `'flow_cache.h5'` | HDF5 cache from `scripts/solve_flow.py`. `None` ⇒ zero flow + all-fluid mask. |
 | `mixing_scale` | 1.0 | Multiplier on the cached velocity field (e.g. `2.0` halves the eddy turnover time without re-solving Stage 1). |
-| `ic_mode` | `'uniform'` | `'uniform'` distributes each species across all fluid cells; `'octant'` localises the IC to one octant of the cylinder (used to study advective dieback in `examples/example.py`). |
+| `ic_mode` | `'uniform'` | `'uniform'` distributes each channel across all fluid cells; `'octant'` localises the IC to one octant of the cylinder (used to study advective dieback in `examples/example.py`). |
 | `ic_octant` | `(1, 1, 1)` | Sign of `(x, y, z)` selecting the octant when `ic_mode='octant'`. |
 | `device` | `'cpu'` | `'cpu'` or `'cuda'` |
 
@@ -224,11 +204,10 @@ After the outer loop converges, a single **unpreconditioned CG pass** on `−lap
 `Simulator.run()` returns a `SimResults` object. Spatial averages are taken over **fluid cells only** (the wall mask does not dilute the reported means):
 
 ```python
-r.L_final           # final lactic acid (fluid average)
-r.Sn_final          # final nisin (fluid average)
+r.L_final           # final lactate-style objective (fluid average)
 r.elapsed           # wall-clock time [seconds]
-r.final_values()    # dict of all 8 channels at final time
-r.spatial_average() # numpy array [T, 8] (or [B, T, 8] for B>1)
+r.final_values()    # dict of all 13 channels at final time
+r.spatial_average() # numpy array [T, 13] (or [B, T, 13] for B>1)
 
 r.gif('out.gif')        # mid-z slice animation, wall boundary contoured
 r.snapshot('out.png')   # mid-z heatmap at final time

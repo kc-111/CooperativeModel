@@ -32,8 +32,7 @@ CANDIDATES = [
     # ('C  pair P_3 (N3)',  S_LO,  S_LO,  S_HI,  S_HI),
     # ('D  pair P_4 (N4)',  S_HI,  S_LO,  S_LO,  S_HI),
 ]
-samples = [[N0, N0, N0, N0, 0.0, R1, R2, R3, R4,
-            0.0, 0.0, 0.0, 0.0]
+samples = [[N0, N0, N0, N0, 0.0, R1, R2, R3, R4, 0.0, 0.0, 0.0, 0.0]
            for (_, R1, R2, R3, R4) in CANDIDATES]
 
 FLOW_CACHE = 'flow_cache.h5'

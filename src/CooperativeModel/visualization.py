@@ -21,15 +21,15 @@ CHANNEL_NAMES = [
     'T1', 'T2', 'T3', 'T4',
 ]
 
-# Curves are split into two auto-scaled panels because biomass/product
-# (channels 0-4, 9-12) and resources (channels 5-8) routinely differ
-# by orders of magnitude — a single shared y-axis collapses one group to a
-# flat line.  Toxins sit with biomass since they share the small scale.
+# Curves are split into two auto-scaled panels because biomass/product/toxin
+# (channels 0-4, 9-12) and resources (channels 5-8) routinely differ by
+# orders of magnitude — a single shared y-axis collapses one group to a
+# flat line.
 _LO_GROUP = (0, 1, 2, 3, 4, 9, 10, 11, 12)   # N1..N4, L, T1..T4
 _HI_GROUP = (5, 6, 7, 8)                       # R1..R4
 
 N_CHANNELS = len(CHANNEL_NAMES)
-L_CH = 4   # lactic acid channel index (updated for new channel layout)
+L_CH = 4   # lactic acid channel index
 
 
 def _add_mask_contour(ax, mask2d):
@@ -135,14 +135,14 @@ def plot_snapshot(slice_results, t_eval, time_idx, grid_cfg=None,
     """Plot mid-z-slice heatmaps of selected channels at a given time.
 
     Args:
-        slice_results: ``[1, T, 9, Ny, Nx]`` mid-z slice of the result.
+        slice_results: ``[1, T, 13, Ny, Nx]`` mid-z slice of the result.
         t_eval: ``[T]`` time points.
         time_idx: index into t_eval.
         grid_cfg: optional ``GridConfig`` for axis labels.
         mask2d: optional 2-D fluid mask to draw as a contour.
-        channels: list of channel indices to plot (default: all 8).
+        channels: list of channel indices to plot (default: all 13).
     """
-    data = slice_results[0, time_idx].detach().cpu().numpy()  # [8, Ny, Nx]
+    data = slice_results[0, time_idx].detach().cpu().numpy()  # [13, Ny, Nx]
     t = t_eval[time_idx].item()
 
     if channels is None:
@@ -177,9 +177,9 @@ def plot_spatial_average(means, t_eval, channels=None, figsize=(10, 6)):
     """Plot fluid-averaged concentrations over time.
 
     Args:
-        means: ``[T, 8]`` fluid-averaged time series (numpy or tensor).
+        means: ``[T, 13]`` fluid-averaged time series (numpy or tensor).
         t_eval: ``[T]`` time points.
-        channels: list of channel indices (default: all 8).
+        channels: list of channel indices (default: all 13).
     """
     if hasattr(means, 'detach'):
         means = means.detach().cpu().numpy()
@@ -210,12 +210,12 @@ def animate_all_fields_with_curves(slice_results, t_eval, channels=None,
     """Animate mid-z-slice heatmaps with fluid-averaged curves below.
 
     Args:
-        slice_results: ``[1, T, 9, Ny, Nx]`` mid-z slice tensor.
+        slice_results: ``[1, T, 13, Ny, Nx]`` mid-z slice tensor.
         t_eval: ``[T]`` time points.
-        channels: heatmap channels (default: all 8).
-        curve_channels: channels to plot as time series (default: [2, 3]).
+        channels: heatmap channels (default: all 13).
+        curve_channels: channels to plot as time series (default: all 13).
         mask2d: 2-D fluid mask drawn as a contour overlay on every panel.
-        curve_means: ``[T, 8]`` fluid-averaged time series to plot.  If
+        curve_means: ``[T, 13]`` fluid-averaged time series to plot.  If
             ``None``, the mean is computed over the 2-D slice (suitable
             for the well-mixed limit where slice == volume).
         interval: ms between frames.
@@ -230,11 +230,11 @@ def animate_all_fields_with_curves(slice_results, t_eval, channels=None,
     ncols = min(4, nc)
     nrows_maps = (nc + ncols - 1) // ncols
 
-    data = slice_results[0].detach().cpu().numpy()  # [T, 9, Ny, Nx]
+    data = slice_results[0].detach().cpu().numpy()  # [T, 13, Ny, Nx]
     t = t_eval.detach().cpu().numpy() if hasattr(t_eval, 'detach') else np.asarray(t_eval)
 
     if curve_means is None:
-        curve_means = data.mean(axis=(-2, -1))  # [T, 8]
+        curve_means = data.mean(axis=(-2, -1))  # [T, 13]
     else:
         curve_means = np.asarray(curve_means)
 
@@ -307,18 +307,18 @@ def animate_orthoviews(slices, masks, t_eval, channels=None,
     """Animate three orthogonal slices (mid-z, mid-y, mid-x) per channel.
 
     Args:
-        slices: tuple ``(slz, sly, slx)`` of three ``[1, T, 9, H, W]``
+        slices: tuple ``(slz, sly, slx)`` of three ``[1, T, 13, H, W]``
             mid-plane tensors (z-, y-, x-perpendicular planes).
         masks: tuple ``(mz, my, mx)`` of 2-D fluid masks for each plane,
             used as white-contour overlays.
         t_eval: ``[T]`` time points.
-        channels: heatmap channels (default: all 8).
-        curve_channels: channels to plot as time series (default: [2, 3]).
-        curve_means: ``[T, 8]`` fluid-averaged time series.
+        channels: heatmap channels (default: all 13).
+        curve_channels: channels to plot as time series (default: all 13).
+        curve_means: ``[T, 13]`` fluid-averaged time series.
         interval: ms between frames.
         save_path: ``.gif`` or ``.mp4`` (optional).
 
-    Layout: 8 rows (one per channel) by 3 columns (z, y, x slices), with
+    Layout: 13 rows (one per channel) by 3 columns (z, y, x slices), with
     a fluid-averaged time-series strip below.
     """
     if channels is None:
@@ -329,9 +329,9 @@ def animate_orthoviews(slices, masks, t_eval, channels=None,
     slz, sly, slx = slices
     mz, my, mx = masks
     plane_data = [
-        (slz[0].detach().cpu().numpy(), mz, 'mid-z (xy)'),  # [T, 9, Ny, Nx]
-        (sly[0].detach().cpu().numpy(), my, 'mid-y (xz)'),  # [T, 9, Nz, Nx]
-        (slx[0].detach().cpu().numpy(), mx, 'mid-x (yz)'),  # [T, 9, Nz, Ny]
+        (slz[0].detach().cpu().numpy(), mz, 'mid-z (xy)'),  # [T, 13, Ny, Nx]
+        (sly[0].detach().cpu().numpy(), my, 'mid-y (xz)'),  # [T, 13, Nz, Nx]
+        (slx[0].detach().cpu().numpy(), mx, 'mid-x (yz)'),  # [T, 13, Nz, Ny]
     ]
     t = t_eval.detach().cpu().numpy() if hasattr(t_eval, 'detach') else np.asarray(t_eval)
 
