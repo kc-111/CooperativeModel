@@ -1,16 +1,4 @@
-"""Initial-condition generators for the 3D bioreactor model.
-
-Channel ordering: ``[N1..N4, L, R1..R4, T1..T4]`` (13 channels).
-
-Two generators:
-
-  * ``uniform``  — fills every fluid cell with the per-channel value.  The
-    well-mixed limit (1 x 1 x 1) and the BO objective both use this path.
-  * ``octant``   — fills only one octant of the vessel with the per-channel
-    value, leaving the other 7/8 at zero.  The chaotic flow then has to
-    redistribute species across the cylinder, producing visually obvious
-    mixing in the GIFs while leaving ``uniform`` as the default for BO.
-"""
+"""Uniform and octant initial conditions for the bioreactor."""
 
 import torch
 
@@ -42,19 +30,11 @@ def uniform(grid_cfg, N1=0.01, N2=0.01, N3=0.01, N4=0.01, L=0.0,
             R1=2.0, R2=2.0, R3=2.0, R4=2.0,
             T1=0.0, T2=0.0, T3=0.0, T4=0.0,
             mask=None, device='cpu', dtype=torch.float64):
-    """Spatially-uniform initial condition, ``[B, 13, Nz, Ny, Nx]``.
+    """Fill fluid cells with per-channel values; return [B, 13, Nz, Ny, Nx].
 
-    Each value can be a scalar (single sample) or a 1-D sequence/tensor of
-    length B.  The well-mixed limit (1 x 1 x 1) and the full 3D vessel use
-    the same path.
-
-    Args:
-        grid_cfg: ``GridConfig`` instance.
-        N1..N4, L, R1..R4, T1..T4: per-channel concentrations.
-        mask: optional fluid mask, ``[Nz, Ny, Nx]`` or
-            ``[1, 1, Nz, Ny, Nx]`` (1 = fluid, 0 = wall).  When given, wall
-            cells are zeroed in the returned IC.
-        device, dtype: torch placement.
+    Channel values are scalars or sequences of length B, ordered as
+    [N1..N4, L, R1..R4, T1..T4]. The optional fluid mask (1=fluid)
+    zeros wall cells and has shape [Nz, Ny, Nx] or [1, 1, Nz, Ny, Nx].
     """
     Nz, Ny, Nx = grid_cfg.Nz, grid_cfg.Ny, grid_cfg.Nx
     values = [N1, N2, N3, N4, L, R1, R2, R3, R4, T1, T2, T3, T4]
@@ -81,19 +61,12 @@ def octant(grid_cfg, N1=0.01, N2=0.01, N3=0.01, N4=0.01, L=0.0,
            T1=0.0, T2=0.0, T3=0.0, T4=0.0,
            octant=(1, 1, 1),
            mask=None, device='cpu', dtype=torch.float64):
-    """Initial condition concentrated in a single octant of the vessel.
+    """Fill one octant with per-channel values and zero all other cells.
 
-    Each species takes its given value inside the chosen octant (cells where
-    ``(sx*(x-Lx/2), sy*(y-Ly/2), sz*(z-Lz/2)) >= 0`` for ``octant=(sx,sy,sz)``)
-    and zero elsewhere.  Wall cells are zeroed by ``mask`` as in ``uniform``.
-
-    Args:
-        grid_cfg: ``GridConfig`` instance.
-        N1..N4, L, R1..R4, T1..T4: per-channel concentrations inside the octant.
-        octant: 3-tuple of +-1 selecting (x_sign, y_sign, z_sign) relative to
-            the vessel centre ``(Lx/2, Ly/2, Lz/2)``.  Default ``(+1, +1, +1)``.
-        mask: optional fluid mask, ``[Nz, Ny, Nx]`` or ``[1, 1, Nz, Ny, Nx]``.
-        device, dtype: torch placement.
+    Return shape is [B, 13, Nz, Ny, Nx], with the same channels as uniform.
+    The octant signs (+1 or -1) select each side of the vessel center.
+    Values are concentrations within the octant, without volume rescaling.
+    An optional fluid mask zeros wall cells.
     """
     Nz, Ny, Nx = grid_cfg.Nz, grid_cfg.Ny, grid_cfg.Nx
     values = [N1, N2, N3, N4, L, R1, R2, R3, R4, T1, T2, T3, T4]

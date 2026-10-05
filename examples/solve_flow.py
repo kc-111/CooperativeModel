@@ -1,12 +1,6 @@
-"""CLI to solve the steady 3D bioreactor flow once and cache to HDF5.
+"""Compute steady bioreactor flow and save an HDF5 cache.
 
-Usage::
-
-    python scripts/solve_flow.py --out flow_cache.h5            # 32^3, defaults
-    python scripts/solve_flow.py --grid 16 16 16 --out small.h5 # smoke
-
-The Stage-2 species transport / BO loop loads this cache via
-``CooperativeModel.flow_3d.load_flow`` and never re-solves the flow.
+Run with: python examples/solve_flow.py --out flow_cache.h5
 """
 
 import argparse

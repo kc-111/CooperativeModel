@@ -1,13 +1,4 @@
-"""Configuration and parameters for the 3D bioreactor model.
-
-Model: 4-species Liebig consumer-resource on a cyclic 4-cycle (batch mode);
-see ``kinetics.py`` for the equations.
-
-Grid and solver settings are also defined here.  Explicit species
-diffusion is not modelled: mixing in the 3D run is driven entirely by
-chaotic advection from the non-axisymmetric impeller body force, plus the
-modest numerical diffusion contributed by first-order upwind advection.
-"""
+"""Kinetic parameters, grid dimensions, and solver settings."""
 
 import torch
 from dataclasses import dataclass, field
@@ -15,62 +6,33 @@ from dataclasses import dataclass, field
 
 @dataclass
 class ModelParameters:
-    """Kinetic parameters for the 4-species Liebig consumer-resource model.
-
-    The symmetric defaults below give four equal-height local optima of
-    ``L(t_final)`` at the four "two-resources-high, two-resources-low"
-    corners of the initial-condition box.  Symmetry can be broken by
-    setting different per-species ``mu_i`` or ``Y_i``.
-    """
+    """Growth, resource consumption, product formation, and inhibition parameters."""
 
     # Per-species maximum growth rates [time^-1]
     mu: list = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0])
 
-    # Monod half-saturation on each resource.  Scalar (not per-species)
-    # for the symmetric base case: ``Liebig_i = min_{j in P_i} R_j / (K + R_j)``.
-    # K also serves as the Hill K for the R-poison inhibition term, so
-    # the natural scale that separates LO from HI is shared between
-    # uptake and inhibition.
+    # Half-saturation for uptake and half-inhibition for unused resources.
     K: float = 0.5
 
-    # Hill exponent for the resource-poison inhibition term.  Each
-    # species i is repressed by ``R_{(i+2) mod 4}`` via
-    # ``inh_R = K^h_R / (K^h_R + R_poison^h_R)``.  h_R = 4 gives a sharp
-    # switch at the K scale.
+    # Resource inhibition Hill exponent.
     h_R: float = 4.0
 
-    # Per-species stoichiometric coefficient: each species i consumes
-    # ``c_i * g_i * N_i`` from each of its two paired resources.
+    # Consumption of each required resource per unit biomass growth.
     c: list = field(default_factory=lambda: [1.0, 1.0, 1.0, 1.0])
 
-    # Per-species lactate yield: dL/dt = sum_i Y_i * g_i * N_i.  Slight
-    # per-species asymmetry breaks degeneracy between the four pair
-    # corners so the optimiser does not see four exactly-equal optima.
+    # Per-species product yields.
     Y: list = field(default_factory=lambda: [0.995, 1.001, 1.005, 0.999])
 
-    # Toxin production per unit growth flux: ``dT_i/dt`` has a source
-    # term ``beta * g_i * N_i``.  Tying production to growth (not just
-    # biomass) means a poisoned / Liebig-starved species produces no
-    # toxin, so the toxin pool reflects which species are *actually*
-    # active, not just present.
+    # Toxin production per unit biomass growth.
     beta: float = 1.0
 
-    # First-order toxin decay rate [time^-1].  Slow clearance lets toxin
-    # pools persist after the producing species' paired resources are
-    # depleted, which is what closes the "depletion cascade" channel.
+    # Toxin decay rate [time^-1].
     gamma: float = 0.1
 
-    # Hill K for toxin inhibition.  ``inh_T = K_T^h_T / (K_T^h_T +
-    # T_other^h_T)`` where ``T_other = T_tot - T_i``.  With beta = 1.0,
-    # gamma = 0.1 and mature biomass ~ 1, the steady toxin pool is on
-    # the order 1-10, so K_T = 0.5 puts the inhibition threshold well
-    # below the active-species toxin level (suppression is strong) but
-    # safely above the initial T = 0 (no spurious self-inhibition at
-    # t = 0).
+    # Half-inhibition constant for other species' toxins.
     K_T: float = 0.5
 
-    # Hill exponent for toxin inhibition.  h_T = 4 matches h_R for a
-    # sharp on/off transition at the K_T scale.
+    # Toxin inhibition Hill exponent.
     h_T: float = 4.0
 
     def to_tensors(self, device='cpu', dtype=torch.float64):
@@ -94,11 +56,7 @@ class ModelParameters:
 
 @dataclass
 class GridConfig:
-    """3D Cartesian grid configuration.
-
-    The cylinder axis is z; the cylinder is inscribed in the (x, y) cross-section
-    of the cube. Wall mask is built by ``velocity_fields.cylinder_mask(grid)``.
-    """
+    """Cartesian grid dimensions and cell sizes for the cylindrical reactor."""
 
     Nx: int = 32       # grid points in x
     Ny: int = 32       # grid points in y

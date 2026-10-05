@@ -1,22 +1,4 @@
-"""3D bioreactor geometry and impeller body-force.
-
-Stage-1 utilities consumed by ``flow_3d.solve_steady_flow``:
-
-  - ``cylinder_mask(grid)``        — fluid/wall mask for a cylinder inscribed
-                                     in the (x, y) cross-section of the cube,
-                                     with z = 0 and z = Nz - 1 end-caps marked
-                                     as walls.
-  - ``impeller_body_force(...)``   — non-axisymmetric azimuthal body force
-                                     after Pericleous & Patel (1987).  A single
-                                     localised blade at ``theta_0`` breaks
-                                     theta-symmetry to unlock chaotic
-                                     Lagrangian streamlines.
-  - ``azimuthal_unit(grid)``       — Cartesian theta-hat at every cell centre.
-
-Shape conventions:
-    Scalar fields :  [Nz, Ny, Nx]
-    Vector fields :  [3, Nz, Ny, Nx]  with channels [vx, vy, vz]
-"""
+"""Cylindrical fluid mask and prescribed Gaussian stirring force."""
 
 import math
 import torch
@@ -32,18 +14,10 @@ def _cell_centres(grid, device, dtype):
 
 
 def cylinder_mask(grid, device='cpu', dtype=torch.float64):
-    """Cylinder fluid/wall mask, [Nz, Ny, Nx].
+    """Return a [Nz, Ny, Nx] mask with 1 for fluid and 0 for walls.
 
-    Cylinder axis is z; the cylinder is inscribed in the (x, y) cross-section
-    of the cube (radius = min(Lx, Ly) / 2, centred at (Lx/2, Ly/2)).  The
-    z = 0 and z = Nz - 1 end-cap planes are also marked as wall.
-
-    Args:
-        grid: ``GridConfig`` instance.
-        device, dtype: Torch placement.
-
-    Returns:
-        mask: ``[Nz, Ny, Nx]`` float tensor; 1.0 = fluid, 0.0 = wall.
+    The cylinder is centered at (Lx/2, Ly/2), with radius min(Lx, Ly)/2.
+    End caps and box-edge cells are walls.
     """
     X, Y, _ = _cell_centres(grid, device=device, dtype=dtype)
     cx = grid.Lx * 0.5
@@ -57,16 +31,7 @@ def cylinder_mask(grid, device='cpu', dtype=torch.float64):
         (torch.arange(grid.Nz, device=device).reshape(-1, 1, 1) == 0)
         | (torch.arange(grid.Nz, device=device).reshape(-1, 1, 1) == grid.Nz - 1)
     )
-    # Also force the four side faces of the bounding box (j=0, j=Ny-1,
-    # i=0, i=Nx-1) to wall.  With Lx = Ly and radius = 0.5*Lx, a few
-    # otherwise-fluid cells near (y, x) = (Ly/2, 0) and similar corners
-    # touch the box edge.  The replicate padding in the projection chain
-    # (``_div(_grad(p))``) silently collapses the +y / -y face contribution
-    # at those cells, leaving the operator rank-deficient and breaking the
-    # discrete identity ``div_open(grad_open(p)) = lap_open(p)``.  Excluding
-    # them removes the issue at negligible volumetric cost (≤ 1% of fluid
-    # cells at 32^3) and means the species advection's open-face MAC
-    # divergence agrees with the flow projection at every fluid cell.
+    # Exclude box-edge cells to keep projection and transport stencils consistent.
     box_edge = (
         (torch.arange(grid.Ny, device=device).reshape(1, -1, 1) == 0)
         | (torch.arange(grid.Ny, device=device).reshape(1, -1, 1) == grid.Ny - 1)
@@ -78,10 +43,9 @@ def cylinder_mask(grid, device='cpu', dtype=torch.float64):
 
 
 def azimuthal_unit(grid, device='cpu', dtype=torch.float64):
-    """Cartesian theta-hat at every cell centre, [3, Nz, Ny, Nx].
+    """Return tangential directions [-sin(theta), cos(theta), 0].
 
-    Channel order is [tx, ty, tz] = [-sin(theta), cos(theta), 0].
-    The radial origin is the cylinder axis (Lx/2, Ly/2).
+    The axis is at (Lx/2, Ly/2); output shape is [3, Nz, Ny, Nx].
     """
     X, Y, _ = _cell_centres(grid, device=device, dtype=dtype)
     cx = grid.Lx * 0.5
@@ -109,37 +73,12 @@ def impeller_body_force(
     device='cpu',
     dtype=torch.float64,
 ):
-    """Non-axisymmetric impeller body force, [3, Nz, Ny, Nx].
+    """Return a stationary Gaussian tangential force, [3, Nz, Ny, Nx].
 
-    Force model (Pericleous & Patel 1987-style azimuthal momentum source,
-    with theta-localisation to break axisymmetry):
-
-        f(r, z, theta)  =  F0 * chi_rz(r, z) * chi_theta(theta) * theta_hat
-
-    where::
-
-        chi_rz(r, z)    = exp(-((r - r_imp)^2 / (2 sigma_r^2)
-                              +  (z - z_imp)^2 / (2 sigma_z^2)))
-        chi_theta(t)    = exp(-d_circ(t, theta_0)^2 / (2 sigma_theta^2))
-        d_circ(a, b)    = min(|a - b|, 2*pi - |a - b|)   # periodic distance
-
-    A single localised blade at ``theta_0`` (width ``sigma_theta``) breaks the
-    rotational symmetry of an axisymmetric toroidal forcing.  In a steady NS
-    solve this produces non-axisymmetric mean flow whose Lagrangian
-    streamlines are chaotic — characteristic of real stirred tanks.
-
-    Args:
-        grid: ``GridConfig``.
-        F0: Peak body-force magnitude [cm/h^2].
-        r_imp: Radial position of the blade.  Default ``Lx / 4``.
-        z_imp: Axial position of the blade.  Default ``Lz / 2``.
-        sigma_r: Radial Gaussian width.  Default ``Lx / 16``.
-        sigma_z: Axial Gaussian width.  Default ``Lz / 16``.
-        theta_0: Azimuth of the blade [rad], default 0.
-        sigma_theta: Angular Gaussian width [rad], default pi/6.
-
-    Returns:
-        f: ``[3, Nz, Ny, Nx]`` body-force vector field; channels [fx, fy, fz].
+    F0 is the peak acceleration [cm/h^2]. The radial and vertical centers
+    are r_imp and z_imp; sigma_r and sigma_z are their widths.
+    The angular center and width are theta_0 and sigma_theta [rad].
+    Defaults: r_imp=Lx/4, z_imp=Lz/2, sigma_r=Lx/16, sigma_z=Lz/16.
     """
     if r_imp is None:
         r_imp = 0.25 * grid.Lx

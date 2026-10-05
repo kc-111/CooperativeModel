@@ -2,27 +2,7 @@ import torch
 from tqdm.auto import tqdm
 
 class Tsit5SolverTorch:
-    """
-    An adaptive step-size Tsitouras 5(4) Runge-Kutta solver with dense output
-    via cubic Hermite interpolation, implemented in PyTorch.
-
-    Dense output: The solver takes natural adaptive steps and interpolates the
-    solution at requested output times using the FSAL (First Same As Last)
-    property, which provides derivatives at both endpoints of each step for free.
-
-    All intermediate buffers are preallocated to eliminate per-step memory
-    allocation overhead — critical for large spatial systems.
-
-    Tsit5 Solver:
-    Tsitouras, C. (2011). Runge-Kutta pairs of order 5 (4) satisfying only the
-    first column simplifying assumption. Computers & mathematics with applications,
-    62(2), 770-775.
-
-    Error Control:
-    Hairer, E., Wanner, G., & Norsett, S. P. (1993). Solving ordinary
-    differential equations I: Nonstiff problems. Berlin, Heidelberg:
-    Springer Berlin Heidelberg.
-    """
+    """Adaptive Dormand-Prince 5(4) integration with cubic Hermite output."""
     def __init__(self, atol=1e-6, rtol=1e-6, h_min=1e-8, h_max=10.0, maxiters=1000000):
         self.atol = atol
         self.rtol = rtol
@@ -32,8 +12,7 @@ class Tsit5SolverTorch:
         self.p = 4
         self.safety_factor = 0.9
 
-        # Tsitouras 5(4) Butcher Tableau — store as Python floats to avoid
-        # repeated .item() calls in the hot loop
+        # Dormand-Prince 5(4) coefficients.
         self.A = [
             [],
             [0.2],
@@ -54,21 +33,12 @@ class Tsit5SolverTorch:
         self.e_nz = [(i, self.e[i]) for i in range(7) if self.e[i] != 0.0]
 
     def solve(self, fun, y0, t_span, t_eval, args=None, h0=0.1, progress=True):
-        """
-        Solves a batch of ODEs using dense output with preallocated buffers.
+        """Integrate a batch of ODEs and interpolate at t_eval.
 
-        Args:
-            fun (callable): fun(t, y, args) -> dy/dt
-            y0 (torch.Tensor): Initial state, (num_samples, num_vars).
-            t_span (tuple): (t_start, t_end).
-            t_eval (torch.Tensor): Output time points.
-            args: Additional arguments for fun.
-            h0 (float): Initial step size.
-            progress (bool | str): If truthy, show a tqdm bar tracking integration
-                time. Pass a string to use it as the bar description.
-
-        Returns:
-            torch.Tensor: (num_samples, len(t_eval), num_vars).
+        fun(t, y, args) returns derivatives shaped like y0 [B, num_vars].
+        t_span gives the start and end times; h0 is the initial step size.
+        progress enables a progress bar, optionally with a custom label.
+        Returns a tensor [B, len(t_eval), num_vars].
         """
         device, dtype = y0.device, y0.dtype
         num_samples, num_vars = y0.shape
@@ -81,7 +51,7 @@ class Tsit5SolverTorch:
         n_eval = len(t_eval)
         total_span = t_end - t_start
 
-        # ---- Preallocate ALL buffers ----
+        # Preallocate ALL buffers
         ks = torch.zeros((7, num_samples, num_vars), dtype=dtype, device=device)
         dy = torch.empty((num_samples, num_vars), dtype=dtype, device=device)
         y_stage = torch.empty_like(dy)
@@ -93,7 +63,7 @@ class Tsit5SolverTorch:
 
         inv_sqrt_nv = 1.0 / (num_vars ** 0.5)
 
-        # ---- State ----
+        # State
         y = y0.clone()
         t = t_start
         h = h0
@@ -127,7 +97,7 @@ class Tsit5SolverTorch:
                 if h_current < self.h_min:
                     h_current = self.h_min
 
-                # ---- RK stages (FSAL: ks[0] = f_current) ----
+                # RK stages (FSAL: ks[0] = f_current)
                 ks[0].copy_(f_current)
                 for j in range(1, 7):
                     Aj = A[j]
@@ -139,21 +109,21 @@ class Tsit5SolverTorch:
                     torch.add(y, dy, alpha=h_current, out=y_stage)
                     ks[j] = fun(t + h_current * c[j], y_stage, args)
 
-                # ---- y_new = y + h * sum(b[i] * ks[i]) ----
+                # y_new = y + h * sum(b[i] * ks[i])
                 i0, b0 = b_nz[0]
                 y_new.copy_(ks[i0]).mul_(b0)
                 for i, bi in b_nz[1:]:
                     y_new.add_(ks[i], alpha=bi)
                 y_new.mul_(h_current).add_(y)
 
-                # ---- error = h * sum(e[i] * ks[i]) ----
+                # error = h * sum(e[i] * ks[i])
                 i0, e0 = e_nz[0]
                 error_estimate.copy_(ks[i0]).mul_(e0)
                 for i, ei in e_nz[1:]:
                     error_estimate.add_(ks[i], alpha=ei)
                 error_estimate.mul_(h_current)
 
-                # ---- Adaptive step-size control (fused, in-place) ----
+                # Adaptive step-size control (fused, in-place)
                 torch.maximum(y.abs(), y_new.abs(), out=abs_max)
                 scaled_err.copy_(abs_max).mul_(rtol).add_(atol + 1e-9)
                 torch.div(error_estimate, scaled_err, out=scaled_err)
@@ -164,8 +134,7 @@ class Tsit5SolverTorch:
                     t_new = t + h_current
                     y_new.clamp_(min=0.0)
 
-                    # Interpolate at t_eval points within [t, t_new]
-                    # Use ks[0] for f_start (safe copy), ks[6] for f_end
+                    # Interpolate using the start and end derivatives in ks[0] and ks[6].
                     while eval_idx < n_eval and t_eval[eval_idx].item() <= t_new + 1e-12:
                         t_target = t_eval[eval_idx].item()
                         theta = (t_target - t) / h_current if h_current > 1e-15 else 1.0

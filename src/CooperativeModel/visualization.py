@@ -1,14 +1,4 @@
-"""Visualisation utilities for the 3D bioreactor simulator.
-
-The renderers operate on **mid-z slices** produced by ``SimResults``;
-inputs therefore have shape ``[1, T, 13, Ny, Nx]``.  The wall-fluid
-boundary is overlaid as a white contour from a 2-D ``mask2d``
-(1=fluid, 0=wall) so the cylinder geometry is visible in every frame.
-
-Time-series curves are pre-computed over the full 3-D fluid region by
-``SimResults._fluid_mean`` and passed in as a ``[T, 13]`` array; the
-plotting code does not redo the spatial reduction.
-"""
+"""Concentration heatmaps, time-series plots, and animations."""
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -21,10 +11,7 @@ CHANNEL_NAMES = [
     'T1', 'T2', 'T3', 'T4',
 ]
 
-# Curves are split into two auto-scaled panels because biomass/product/toxin
-# (channels 0-4, 9-12) and resources (channels 5-8) routinely differ by
-# orders of magnitude — a single shared y-axis collapses one group to a
-# flat line.
+# Scale biomass/products and resources independently.
 _LO_GROUP = (0, 1, 2, 3, 4, 9, 10, 11, 12)   # N1..N4, L, T1..T4
 _HI_GROUP = (5, 6, 7, 8)                       # R1..R4
 
@@ -41,24 +28,12 @@ def _add_mask_contour(ax, mask2d):
 
 def _setup_curve_panels(fig, gs, row_idx, ncols_total, t, curve_means,
                         curve_channels):
-    """Lay out one or two curve panels with independent y-axis auto-scaling.
+    """Create independently scaled biomass/product and resource curve panels.
 
-    If ``curve_channels`` spans both the biomass/product group (0-3) and the
-    sugar group (4-7) the bottom strip is split into two side-by-side panels,
-    each auto-scaled to its own data.  Otherwise a single full-width panel is
-    used.
-
-    Lactic acid (channel 3) is drawn on a *twin* y-axis inside the
-    biomass+products panel — under octant initial conditions the
-    fluid-averaged L lags far behind N1, so a shared y-axis collapses it
-    to a near-flat line near zero.  The twin axis lets L use its own
-    auto-scaled range while still sharing the time axis.
-
-    Returns:
-        lines:  list of (Line2D, channel_idx) — one entry per plotted channel.
-        vlines: list of axvline objects (one per panel) for the time cursor.
+    L (channel 4) gets a separate y-axis when plotted with other channels.
+    Returns (line, channel) pairs and time-cursor lines.
     """
-    import matplotlib.pyplot as plt  # local: keeps the helper self-contained
+    import matplotlib.pyplot as plt
 
     lo = [c for c in curve_channels if c in _LO_GROUP]
     hi = [c for c in curve_channels if c in _HI_GROUP]
@@ -80,8 +55,7 @@ def _setup_curve_panels(fig, gs, row_idx, ncols_total, t, curve_means,
         twin_ax = None
         primary = [c for c in channels if c != L_CH]
         secondary = [c for c in channels if c == L_CH]
-        # Only use a twin axis when L sits alongside other curves; if L is the
-        # only channel in this panel, give it the primary axis itself.
+        # Use a separate y-axis for L when other channels share its panel.
         if secondary and primary:
             twin_ax = ax.twinx()
         else:
@@ -207,19 +181,12 @@ def animate_all_fields_with_curves(slice_results, t_eval, channels=None,
                                    curve_means=None, interval=150,
                                    figsize=None, title_prefix=None,
                                    save_path=None):
-    """Animate mid-z-slice heatmaps with fluid-averaged curves below.
+    """Animate concentration slices with time-series curves.
 
-    Args:
-        slice_results: ``[1, T, 13, Ny, Nx]`` mid-z slice tensor.
-        t_eval: ``[T]`` time points.
-        channels: heatmap channels (default: all 13).
-        curve_channels: channels to plot as time series (default: all 13).
-        mask2d: 2-D fluid mask drawn as a contour overlay on every panel.
-        curve_means: ``[T, 13]`` fluid-averaged time series to plot.  If
-            ``None``, the mean is computed over the 2-D slice (suitable
-            for the well-mixed limit where slice == volume).
-        interval: ms between frames.
-        save_path: ``.gif`` or ``.mp4`` to save (optional).
+    slice_results has shape [1, T, 13, Ny, Nx]; t_eval gives output times.
+    channels and curve_channels select fields; mask2d marks fluid cells.
+    curve_means is [T, 13]; None uses slice averages.
+    interval is in milliseconds; save_path accepts .gif or .mp4.
     """
     if channels is None:
         channels = list(range(N_CHANNELS))
@@ -246,10 +213,7 @@ def animate_all_fields_with_curves(slice_results, t_eval, channels=None,
                           height_ratios=[1] * nrows_maps + [1.0],
                           hspace=0.45, wspace=0.35)
 
-    # Per-frame normalisation: each frame's vmax = that frame's slice max.
-    # Concentrations sweep orders of magnitude as the reaction-advection-
-    # diffusion system evolves; a global vmax washes out spatial structure.
-    # Re-scaling per frame preserves the *pattern* of mixing in each frame.
+    # Rescale each frame to show spatial concentration patterns.
     ims = []
     hm_axes = []
     for idx, ch in enumerate(channels):
@@ -304,22 +268,12 @@ def animate_all_fields_with_curves(slice_results, t_eval, channels=None,
 def animate_orthoviews(slices, masks, t_eval, channels=None,
                        curve_channels=None, curve_means=None,
                        interval=150, figsize=None, save_path=None):
-    """Animate three orthogonal slices (mid-z, mid-y, mid-x) per channel.
+    """Animate mid-z, mid-y, and mid-x slices for each selected channel.
 
-    Args:
-        slices: tuple ``(slz, sly, slx)`` of three ``[1, T, 13, H, W]``
-            mid-plane tensors (z-, y-, x-perpendicular planes).
-        masks: tuple ``(mz, my, mx)`` of 2-D fluid masks for each plane,
-            used as white-contour overlays.
-        t_eval: ``[T]`` time points.
-        channels: heatmap channels (default: all 13).
-        curve_channels: channels to plot as time series (default: all 13).
-        curve_means: ``[T, 13]`` fluid-averaged time series.
-        interval: ms between frames.
-        save_path: ``.gif`` or ``.mp4`` (optional).
-
-    Layout: 13 rows (one per channel) by 3 columns (z, y, x slices), with
-    a fluid-averaged time-series strip below.
+    slices contains three [1, T, 13, H, W] tensors with matching 2D masks.
+    t_eval gives output times; channels and curve_channels select fields.
+    curve_means is [T, 13]; interval is in milliseconds.
+    save_path accepts .gif or .mp4.
     """
     if channels is None:
         channels = list(range(N_CHANNELS))

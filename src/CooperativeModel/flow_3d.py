@@ -1,41 +1,4 @@
-"""Steady incompressible Navier-Stokes flow solve and HDF5 cache I/O.
-
-Stage-1 of the 3D pipeline.  Solves an unsteady NS in the cylindrical-tank
-mask until ``||u^{n+1} - u^n||_inf / max(||u^n||_inf, eps) < tol``, holding the
-non-axisymmetric impeller body force fixed.  The converged velocity field is
-saved to HDF5 along with all parameters needed to reproduce it; Stage 2
-loads the cache once per BO evaluation and never re-solves.
-
-Numerics
---------
-Chorin / fractional-step projection on a co-located uniform Cartesian grid:
-
-    u*    = u^n + dt * (-(u^n . grad) u^n + nu * lap u^n + f_imp)
-    apply no-slip on the wall mask (u* = 0 in wall cells)
-    solve  lap p = (1/dt) div u*           with Neumann BCs (red-black GS)
-    u^{n+1} = u* - dt * grad p
-    re-zero u^{n+1} on the wall mask
-
-Discretisation
---------------
-* 7-point Laplacian for the viscous and pressure operators
-* First-order upwind for (u . grad) u (L-stable on the explicit-Euler outer
-  step; we only need the converged steady state, not a high-fidelity transient)
-* Replicate / Neumann padding at all six box boundaries
-* The pressure Poisson uses the **open-face MAC** divergence on the RHS and a
-  matching **open-face FV Laplacian** on the LHS, so the corrector
-  ``u_new = u* - dt * grad_open(p)`` drives ``div_open(u_new)`` to zero at
-  every fluid cell — including those adjacent to walls.  This is the
-  divergence operator the species advection actually uses, so a uniform field
-  is preserved exactly under the converged flow (no spurious wall sources).
-
-Citations
----------
-* Pericleous & Patel (1987), "The modelling of tangential and axial agitators
-  in chemical reactors" — impeller-as-body-force.
-* Delafosse et al. (2014), Chemical Engineering Science 106, 76-85 — the
-  Stage-2 compartment-model framing the cached velocity field feeds.
-"""
+"""Steady incompressible flow solver and HDF5 cache I/O."""
 
 from __future__ import annotations
 
@@ -55,14 +18,7 @@ _PAD_3D = (1, 1, 1, 1, 1, 1)  # (left, right, top, bottom, front, back) — F.pa
 
 
 def _operator_fingerprint():
-    """Hash of the operator-defining functions used by the NS solve.
-
-    Stamped into the cache metadata as ``code_version`` so a cached flow
-    can be detected as stale whenever any of the discretisation primitives
-    (Laplacian, gradient, divergence, advection, pressure GS, CG cleanup)
-    or the steady-state driver itself change source.  Cheaper than carrying
-    a manual version string and impossible to forget to bump.
-    """
+    """Hash solver source text for the flow-cache version metadata."""
     parts = []
     for fn in (_laplacian, _grad, _div, _udotgrad,
                _solve_pressure_rb_gs, _final_cg_projection,
@@ -73,23 +29,14 @@ def _operator_fingerprint():
 
 
 def _pad_replicate(t):
-    """Replicate-pad a [..., Nz, Ny, Nx] tensor by 1 on every face.
-
-    F.pad with mode='replicate' on 5D tensors expects [N, C, D, H, W];
-    we always feed it that shape.
-    """
+    """Pad a [N, C, Nz, Ny, Nx] tensor by one cell on each face."""
     return F.pad(t, _PAD_3D, mode='replicate')
 
 
 def _laplacian(u, dx, dy, dz):
-    """7-point Laplacian on a co-located grid with Neumann BCs.
+    """Return the seven-point Laplacian with Neumann box boundaries.
 
-    Args:
-        u: [N, C, Nz, Ny, Nx] tensor.
-        dx, dy, dz: cell sizes.
-
-    Returns:
-        lap u, same shape as u.
+    Input and output have shape [N, C, Nz, Ny, Nx].
     """
     p = _pad_replicate(u)
     cz, cy, cx = u.shape[-3], u.shape[-2], u.shape[-1]
@@ -106,22 +53,10 @@ def _laplacian(u, dx, dy, dz):
 
 
 def _grad(p, dx, dy, dz, mask=None):
-    """Backward-difference gradient with optional mask-aware face flux.
+    """Return backward pressure gradients gx, gy, gz.
 
-    Without ``mask`` this returns the plain backward-difference gradient.
-    When ``mask`` is given (1=fluid, 0=wall), each face flux is killed if
-    either of the two cells it joins is a wall — this enforces ∂p/∂n = 0
-    at fluid-wall interfaces.  Paired with the forward-difference ``_div``
-    and a mask-aware FV Laplacian in the pressure GS, the projection step
-    drives ``div u_new`` to zero at every fluid cell, including those
-    adjacent to walls.
-
-    Args:
-        p:    [N, 1, Nz, Ny, Nx].
-        mask: optional [N, 1, Nz, Ny, Nx] fluid mask.
-
-    Returns:
-        gx, gy, gz, each [N, 1, Nz, Ny, Nx].
+    Pressure and optional fluid mask have shape [N, 1, Nz, Ny, Nx].
+    The mask (1=fluid) blocks gradients across fluid-wall faces.
     """
     pp = _pad_replicate(p)
     cz, cy, cx = p.shape[-3], p.shape[-2], p.shape[-1]
@@ -143,15 +78,10 @@ def _grad(p, dx, dy, dz, mask=None):
 
 
 def _div(u, v, w, dx, dy, dz, mask=None):
-    """Forward-difference divergence of (u, v, w), each [N, 1, Nz, Ny, Nx].
+    """Return the forward divergence of u, v, w, each [N, 1, Nz, Ny, Nx].
 
-    With ``mask`` (1=fluid, 0=wall), each face contribution is killed when
-    either of the two cells the face joins is a wall — i.e. the operator
-    becomes the open-face MAC divergence used by the species advection.
-    Combined with the mask-aware backward gradient ``_grad`` and the open-face
-    FV Laplacian solved in ``_solve_pressure_rb_gs``, this gives a consistent
-    chain ``div_open ∘ grad_open = lap_open`` so the projection drives
-    ``div_open(u_new)`` to zero at every fluid cell.
+    The optional fluid mask blocks fluid-wall faces. This stencil matches
+    the pressure gradient and scalar transport operators.
     """
     up = _pad_replicate(u)
     vp = _pad_replicate(v)
@@ -188,15 +118,7 @@ def _div(u, v, w, dx, dy, dz, mask=None):
 
 
 def _udotgrad(u, v, w, dx, dy, dz):
-    """First-order upwind ``(u . grad)`` applied to each of u, v, w.
-
-    Upwind is L-stable (CFL < 1 is sufficient), unlike central differences
-    which are unconditionally unstable on the explicit-Euler outer step
-    used here.  The added numerical dissipation is acceptable: we only need
-    a converged steady state, not a high-fidelity transient.
-
-    Returns convective derivatives ``((u.grad)u, (u.grad)v, (u.grad)w)``.
-    """
+    """Return first-order upwind convective derivatives of u, v, w."""
     def _udg_scalar(s):
         sp = _pad_replicate(s)
         cz, cy, cx = s.shape[-3], s.shape[-2], s.shape[-1]
@@ -216,28 +138,11 @@ def _udotgrad(u, v, w, dx, dy, dz):
 
 
 def _solve_pressure_rb_gs(p, rhs, mask, dx, dy, dz, n_sweeps, progress_bar=None):
-    """Red-black Gauss-Seidel for the FV Laplacian with Neumann BCs at walls.
+    """Solve lap(p)=rhs on fluid cells using red-black Gauss-Seidel.
 
-    Solves ``lap p = rhs`` at fluid cells (``mask = 1``), where ``lap`` is the
-    finite-volume Laplacian summing only open (fluid-fluid) faces — equivalent
-    to enforcing ∂p/∂n = 0 at every fluid-wall interface.  This stencil is the
-    exact discrete adjoint of ``div_fwd ∘ grad_bwd_masked`` (see ``_grad``),
-    so the corrector ``u_new = u* − dt · grad p`` produces a velocity whose
-    forward divergence is zero at every fluid cell, including those adjacent
-    to walls.  Walls are left at p = 0 (their values do not enter the stencil).
-
-    The box boundary is replicate-padded — also Neumann.
-
-    Args:
-        p:    [N, 1, Nz, Ny, Nx] initial guess (modified in-place).
-        rhs:  [N, 1, Nz, Ny, Nx] right-hand side.
-        mask: [N, 1, Nz, Ny, Nx] fluid mask (1.0 inside fluid).
-        dx, dy, dz: cell sizes.
-        n_sweeps: number of red-black sweeps.
-        progress_bar: optional tqdm bar to update once per sweep.
-
-    Returns:
-        Updated pressure tensor.
+    Pressure, rhs, and mask have shape [N, 1, Nz, Ny, Nx]; mask=1 is fluid.
+    Only fluid-fluid faces enter the stencil, imposing Neumann wall conditions.
+    Run n_sweeps and optionally update progress_bar; return updated pressure.
     """
     inv_dx2 = 1.0 / (dx * dx)
     inv_dy2 = 1.0 / (dy * dy)
@@ -280,10 +185,7 @@ def _solve_pressure_rb_gs(p, rhs, mask, dx, dy, dz, n_sweeps, progress_bar=None)
             new_p = (num - rhs) / diag_safe
             select = (parity == colour) & (mask > 0.5)
             p = torch.where(select, new_p, p)
-        # Anchor mean-zero each sweep — Neumann Poisson is unique only up
-        # to a constant, and warm-starting from previous outer iterations
-        # can let GS push p far into the constants null space within a
-        # single call.  The shift doesn't change grad p, only its bound.
+        # Remove the arbitrary pressure constant after each sweep.
         p = (p - (p * mask).sum() / n_fluid) * mask
         if progress_bar is not None:
             progress_bar.update(1)
@@ -292,27 +194,10 @@ def _solve_pressure_rb_gs(p, rhs, mask, dx, dy, dz, n_sweeps, progress_bar=None)
 
 def _final_cg_projection(u, v, w, mask, dx, dy, dz,
                          max_iters=2000, tol=1e-12):
-    """Final tight projection: drive ``div_open(u, v, w)`` to roundoff.
+    """Remove remaining divergence with a conjugate-gradient pressure solve.
 
-    Solves ``-lap_open(p) = -div_open(u)`` to high accuracy with un-
-    preconditioned CG, then applies the standard corrector
-    ``u_new = u - grad_open(p)`` (and likewise for v, w).  ``A = -lap_open``
-    is symmetric positive semi-definite on fluid cells under Neumann BCs;
-    the chain ``-_div(_grad(p))`` matches the operator the corrector
-    inverts, so the residual norm of CG equals ``|div_open(u_new)|``
-    modulo roundoff.
-
-    Scaling note: unpreconditioned CG on the Neumann Poisson problem has
-    iteration count growing roughly as ``O(N^{1/3})`` on N^3 grids, since
-    the condition number of the discrete Laplacian scales as h^{-2}.
-    At 32^3 this converges in O(50-300) iterations and is fine.  For
-    significantly larger grids a multigrid V-cycle preconditioner (or
-    geometric MG as the solver outright) would be a drop-in win — it makes
-    iteration count grid-independent at the cost of one extra restriction/
-    prolongation pass per CG step.  Worth doing only if you scale up.
-
-    Returns:
-        u_new, v_new, w_new, n_iters, final_rel_res.
+    Uses the matching masked gradient and divergence operators.
+    Returns u_new, v_new, w_new, iteration count, and relative residual.
     """
     n_fluid = mask.sum().clamp(min=1.0)
 
@@ -374,26 +259,24 @@ def solve_steady_flow(
     dtype=torch.float64,
     progress=True,
 ):
-    """Solve steady NS in the cylindrical mask via projection iteration.
+    """Compute steady velocity by projection iteration.
 
     Args:
-        grid: ``GridConfig`` instance (provides Nx, Ny, Nz, Lx, Ly, Lz).
-        mask: ``[Nz, Ny, Nx]`` float fluid/wall mask (1=fluid).  If ``None``,
-            ``cylinder_mask(grid)`` is used.
+        grid: GridConfig instance.
+        mask: [Nz, Ny, Nx] fluid mask (1=fluid); defaults to cylinder_mask.
         F0, r_imp, z_imp, sigma_r, sigma_z, theta_0, sigma_theta:
-            Forwarded to ``impeller_body_force``.
+            Parameters passed to impeller_body_force.
         nu: Kinematic viscosity [cm^2/h].
-        dt: Pseudo-time step.  If ``None``, set to
-            ``0.4 * min(dx, dy, dz) / max(0.5 * sqrt(F0 * Lx), 1e-3)``.
-        tol: Convergence tolerance on ``||u^{n+1} - u^n||_inf / ||u^n||_inf``.
-        max_iters: Maximum outer iterations.
-        pressure_iters: Inner red-black Gauss-Seidel sweeps per outer step.
-        device, dtype: Torch placement.
-        progress: Show a tqdm bar over the outer iteration.
+        dt: Pseudo-time step [h]; None estimates it from forcing and cell size.
+        tol: Relative velocity-change stopping threshold.
+        max_iters: Outer iteration limit.
+        pressure_iters: Gauss-Seidel sweeps per outer iteration.
+        device, dtype: Tensor placement and precision.
+        progress: Show iteration progress.
 
     Returns:
-        u, v, w: Three ``[Nz, Ny, Nx]`` velocity components, all wall-zeroed.
-        metadata: dict with reproducibility info.
+        u, v, w: [Nz, Ny, Nx] velocity components, zero at walls.
+        metadata: Flow parameters and convergence information.
     """
     from .velocity_fields import cylinder_mask  # local import avoids cycles
 
@@ -405,13 +288,7 @@ def solve_steady_flow(
     dx, dy, dz = grid.dx, grid.dy, grid.dz
 
     if dt is None:
-        # Conservative CFL on the upwind advection.  The rough impeller
-        # force-balance estimate is ``u_ref = 0.5 sqrt(F0 Lx)``; the peak
-        # velocity in the converged field is consistently 2-3x this
-        # (boundary layers, recirculation), so realistic ``u_max`` is
-        # ``~ (1-1.5) sqrt(F0 Lx)``.  Choosing ``dt = 0.15 h / u_ref``
-        # gives  CFL = u_max dt / h = 0.3 (u_max / u_ref) ≈ 0.3-0.45 in
-        # practice — safely below the upwind stability limit of 1.
+        # Estimate the pseudo-time step from forcing and grid spacing.
         u_ref = max(0.5 * math.sqrt(max(F0, 0.0) * grid.Lx), 1e-3)
         dt = 0.15 * min(dx, dy, dz) / u_ref
 
@@ -446,7 +323,7 @@ def solve_steady_flow(
         v_prev = v.clone()
         w_prev = w.clone()
 
-        # --- Predictor: u* = u + dt*(-(u.grad)u + nu*lap u + f) ---
+        # Predictor: u* = u + dt*(-(u.grad)u + nu*lap u + f)
         cu, cv, cw = _udotgrad(u, v, w, dx, dy, dz)
         lu = _laplacian(u, dx, dy, dz)
         lv = _laplacian(v, dx, dy, dz)
@@ -458,22 +335,7 @@ def solve_steady_flow(
         v_star = v_star * mask_5d
         w_star = w_star * mask_5d
 
-        # --- Pressure Poisson: lap_open(p) = div_open(u*) / dt ---
-        # Use the **open-face MAC** divergence on the RHS to match the
-        # open-face FV Laplacian solved by the GS.  With this stencil pair
-        # the discrete identity ``div_open(grad_open(p)) = lap_open(p)`` holds
-        # exactly, so after the corrector  ``u_new = u* - dt · grad_open(p)``
-        # we get  ``div_open(u_new) = div_open(u*) - lap_open(p) · dt = 0``
-        # at every fluid cell — including those adjacent to walls.  This
-        # eliminates the wall-localised divergence that the previous
-        # forward-difference RHS left behind, which had to be removed by a
-        # post-hoc CG cleanup pass.
-        #
-        # Compatibility of the Neumann Poisson problem: ``sum(div_open(u*))``
-        # over fluid cells equals zero by construction (each fluid-fluid face
-        # contributes once with each sign — Stokes), so the RHS is in the
-        # range of ``lap_open`` to roundoff.  We still subtract the fluid-
-        # mean to keep accumulated round-off bounded.
+        # Match divergence and pressure stencils; use a mean-zero Poisson RHS.
         rhs_raw = _div(u_star, v_star, w_star, dx, dy, dz, mask=mask_5d) / dt
         n_fluid = mask_5d.sum().clamp(min=1.0)
         rhs_mean = (rhs_raw * mask_5d).sum() / n_fluid
@@ -487,22 +349,16 @@ def solve_steady_flow(
                                   pressure_iters, progress_bar=inner_bar)
         if inner_bar is not None:
             inner_bar.close()
-        # Anchor pressure: Neumann Poisson is unique only up to a constant,
-        # and warm-starting from the previous outer iteration lets that
-        # constant drift unboundedly across iterations.  Subtracting the
-        # fluid-mean keeps p bounded without changing grad p.
+        # Keep pressure mean-zero without changing its gradient.
         p = (p - (p * mask_5d).sum() / n_fluid) * mask_5d
 
-        # --- Corrector ---
-        # Mask-aware backward gradient — kills face flux at fluid-wall faces
-        # (Neumann), matching the FV Laplacian solved by the GS so the forward
-        # divergence of u_new is identically zero at every fluid cell.
+        # Mask fluid-wall faces consistently with the pressure Laplacian.
         gpx, gpy, gpz = _grad(p, dx, dy, dz, mask=mask_5d)
         u = (u_star - dt * gpx) * mask_5d
         v = (v_star - dt * gpy) * mask_5d
         w = (w_star - dt * gpz) * mask_5d
 
-        # --- Convergence check ---
+        # Convergence check
         diff = torch.maximum(
             (u - u_prev).abs().amax(),
             torch.maximum((v - v_prev).abs().amax(),
@@ -516,12 +372,7 @@ def solve_steady_flow(
         last_residual = residual
         last_iter = it + 1
 
-        # Periodic NS residual: ||−(u·∇)u + ν∇²u + f − ∇p|| over fluid.
-        # The step-size metric ``residual`` only confirms ``u`` has stopped
-        # moving; the NS residual confirms ``u`` actually satisfies the
-        # steady momentum equation.  Recompute the convective and
-        # viscous terms on the *new* velocity and pressure for a faithful
-        # check (the predictor used the old fields).
+        # Check the momentum residual as well as velocity changes.
         if it % ns_residual_every == 0 or residual < tol:
             with torch.no_grad():
                 cu_n, cv_n, cw_n = _udotgrad(u, v, w, dx, dy, dz)
@@ -541,14 +392,7 @@ def solve_steady_flow(
             break
     outer.close()
 
-    # ── Final tight projection (CG to machine epsilon) ─────────────────────
-    # The per-step red-black GS only partially solves the pressure Poisson
-    # (200 sweeps doesn't reach machine epsilon for Neumann Poisson on 32^3).
-    # At convergence of the outer iteration the per-step velocity change is
-    # already small but the cumulative leftover divergence is not.  A single
-    # CG pass on the chain operator A = -lap_open = -div_open(grad_open(·))
-    # drives ``div_open(u_new)`` to roundoff in O(50-300) iterations.  The
-    # corrector is the same form used inside the loop.
+    # Remove remaining divergence with a final conjugate-gradient projection.
     u, v, w, cg_iters, cg_res = _final_cg_projection(
         u, v, w, mask_5d, dx, dy, dz,
     )
@@ -575,8 +419,7 @@ def solve_steady_flow(
         'n_iters': int(last_iter),
         'converged_residual': float(last_residual),
         'dtype': str(dtype),
-        # Derived from a SHA-256 of the operator-defining functions, so a
-        # stencil change auto-invalidates cached flows on next compare.
+        # Source hash for cache metadata.
         'code_version': _operator_fingerprint(),
         **metadata_extra,
     }
@@ -587,16 +430,10 @@ def solve_steady_flow(
             metadata)
 
 
-# ---------------------------------------------------------------------------
-# HDF5 I/O
-# ---------------------------------------------------------------------------
+# HDF5 I/O.
 
 def save_flow(path, u, v, w, mask, metadata):
-    """Write the cached flow to HDF5.
-
-    Datasets:  /u, /v, /w, /mask  — each [Nz, Ny, Nx], saved as float64.
-    Attributes: every key in ``metadata`` written on the root group.
-    """
+    """Save float64 u, v, w, and mask datasets and metadata attributes to HDF5."""
     def _np(t):
         if isinstance(t, torch.Tensor):
             return t.detach().to(dtype=torch.float64, device='cpu').numpy()
@@ -613,12 +450,9 @@ def save_flow(path, u, v, w, mask, metadata):
 
 
 def load_flow(path):
-    """Load a cached flow from HDF5.
+    """Load u, v, w, mask, and metadata from HDF5.
 
-    Returns:
-        u, v, w: ``[Nz, Ny, Nx]`` torch.float64 tensors on CPU.
-        mask:    ``[Nz, Ny, Nx]`` torch.float64 tensor on CPU.
-        metadata: dict of root-level attributes.
+    Fields are [Nz, Ny, Nx] float64 tensors on CPU.
     """
     with h5py.File(path, 'r') as h:
         u = torch.from_numpy(np.asarray(h['u'][...], dtype=np.float64))

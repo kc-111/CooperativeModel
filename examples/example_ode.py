@@ -1,18 +1,6 @@
-"""Example: well-mixed (0D-equivalent) bioreactor — lactic acid comparison.
+"""Compare initial nutrient configurations in a well-mixed batch reactor.
 
-Closed batch reactor with ``grid_shape=(1, 1, 1)``, no diffusion, no
-advection (``flow_cache_path=None``).  The system reduces to 13 coupled
-ODEs (N1..N4, L, R1..R4, T1..T4) in the 4-species Liebig consumer-resource
-model (with per-species toxin pools T_i for the bacteriocin-style
-inhibition channel).
-
-Each of the four "pair corners" in the (R1, R2, R3, R4) initial space
-gives a local maximum of L(t_final) — only the species whose pair P_i is
-supplied with both resources can grow, so single-pair supply
-configurations are intrinsically separated from all-max.
-
-Usage:
-    python examples/example_ode.py
+Run with: python examples/example_ode.py
 """
 
 import sys, os, time
@@ -21,10 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from CooperativeModel import Simulator
 
 
-# Four single-pair corners + the all-max reference.  Resource budget T = 4
-# (matches the symmetric symmetric defaults in ModelParameters).  Each
-# corner concentrates the budget on one P_i pair and starves the antipodal
-# resources, isolating one species' growth.
+# Four species-specific nutrient configurations and a reference.
 S_HI = 2.0
 S_LO = 0.05
 CANDIDATES = [

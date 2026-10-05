@@ -1,23 +1,7 @@
-"""Passive-scalar blob test on the cached 32^3 flow.
+"""Advect a passive Gaussian concentration blob on a cached flow.
 
-Verifies that the stage-2 transport (pure Advection) is well-behaved on the
-actual cached velocity field by tracking a single scalar Gaussian blob
-under chaotic advection (no kinetics, no explicit diffusion).  Mixing
-should be driven entirely by the impeller-induced flow.  Healthy outputs:
-
-    - max(c) over time stays close to its initial value (decays monotonically
-      due to diffusion and numerical dissipation, never blows up)
-    - the blob translates and stretches along streamlines and gradually fills
-      the cylinder via mixing
-    - total mass drift remains small (a percent or two)
-
-Writes:
-    blob_dump.txt   – per-timestep min/max/mean/sum/argmax stats
-    blob.gif        – mid-z animation of the blob with the wall contour overlaid
-    blob.png        – snapshots at t = 0, t/4, t/2, 3t/4, t_final (mid-z)
-
-Usage:
-    python scripts/blob_test.py [flow_cache.h5]
+Write statistics to blob_dump.txt and visualizations to blob.png/blob.gif.
+Run with: python examples/blob_test.py [flow_cache.h5]
 """
 
 import os
@@ -32,12 +16,12 @@ import matplotlib.animation as animation
 from CooperativeModel.flow_3d import load_flow
 from CooperativeModel.spatial_operators import Advection
 
-# ── Config ──────────────────────────────────────────────────────────────────
+# Config
 CACHE = sys.argv[1] if len(sys.argv) > 1 else 'flow_cache.h5'
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 DTYPE = torch.float64
 
-T_FINAL = 48.0      # hours — ~40 eddy turnovers at |v|_max ≈ 1.6 cm/h on a 1 cm domain
+T_FINAL = 48.0      # hours
 N_OUTPUT = 49        # number of saved frames (~ every 30 min)
 MIXING_SCALE = 1.0   # multiply cached velocity field (mass-conserving)
 BLOB_CENTER = (0.5, 0.5, 0.25)   # (z, y, x) — off-center, near +z wall side
@@ -46,7 +30,6 @@ BLOB_AMPL = 1.0
 
 # CFL-derived dt (refined below once we know u_max)
 DT_SAFETY = 0.4
-# ────────────────────────────────────────────────────────────────────────────
 
 
 print(f'Loading {CACHE}...')
@@ -96,7 +79,7 @@ c = c0.clone().reshape(1, 1, Nz, Ny, Nx)
 
 print(f'  blob IC: max = {c.max().item():.3f}, sum = {(c * fluid).sum().item():.3f}')
 
-# ── Time stepping ──────────────────────────────────────────────────────────
+# Time stepping
 save_every = max(1, n_steps // (N_OUTPUT - 1))
 saved_t = []
 saved_c = []
@@ -145,18 +128,14 @@ with open('blob_dump.txt', 'w') as f:
     f.write('\n'.join(log_lines) + '\n')
 print(f'Wrote blob_dump.txt')
 
-# ── Visualisation ──────────────────────────────────────────────────────────
+# Visualisation
 mask_np = mask_fluid.detach().cpu().numpy()
 zmid = Nz // 2
 
 xs = (np.arange(Nx) + 0.5) * dx
 ys = (np.arange(Ny) + 0.5) * dy
 
-# Per-frame normalisation: each frame's vmax = its own peak in the slice.
-# Absolute concentration decays orders of magnitude as the blob mixes; without
-# per-frame rescaling the structure becomes invisible after a fraction of the
-# run.  Re-scaling shows *how* the blob mixes (its shape, location, stretch)
-# rather than just how much it has decayed.
+# Rescale each frame to show the blob shape.
 def _frame_vmax(arr2d):
     m = float(np.nanmax(arr2d))
     return max(m, 1e-12)

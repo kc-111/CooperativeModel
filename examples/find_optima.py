@@ -1,22 +1,7 @@
-"""Find local maxima of L_final over (R1, R2, R3, R4) initial conditions.
+"""Find local maxima of final product in the well-mixed model.
 
-Runs in the **well-mixed limit** (grid_shape=(1, 1, 1), flow_cache_path=None,
-device='cpu'): the optimisation needs hundreds–thousands of objective
-evaluations and the 32^3 PDE costs ~1 s/sample on GPU, while the 13-ODE
-well-mixed system costs ~10 ms/sample on CPU.
-
-Pipeline:
-    1. Batched landscape scan (random interior + 16 corners).
-    2. Greedy epsilon-separated selection of the top peaks.
-    3. scipy.optimize.minimize (L-BFGS-B with box constraints).
-    4. Dedup refined optima by Euclidean distance.
-
-For the cyclic 4-cycle Liebig model with the symmetric defaults, the
-four single-pair corners are expected to land out as the four local
-optima: (R1,R2 hi; R3,R4 lo), (R2,R3 hi; ...), etc.
-
-Usage:
-    python examples/find_optima.py
+Scan initial nutrients, refine selected points with L-BFGS-B, and
+merge nearby solutions. Run with: python examples/find_optima.py
 """
 
 import sys, os, time, itertools
@@ -26,16 +11,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from CooperativeModel import Simulator
 
-# ── Config ──────────────────────────────────────────────────────────────
+# Config
 N0 = 0.01                 # per-species initial biomass
 L0 = 0.0
 T_FINAL = 24.0
-R_MIN, R_MAX = 0.05, 2.0  # resource bounds; R_MIN well below R* ~ K*D/(mu-D)
+R_MIN, R_MAX = 0.05, 2.0  # initial resource bounds
 BOUNDS = [(R_MIN, R_MAX)] * 4
-# Eps-separation for the final dedup is set in (R1..R4) Euclidean space.
-# 1.0 is roughly half the diagonal of the {LO, HI}^4 corner-set in our
-# bounds, so near-corner L-BFGS-B refinements collapse into one optimum
-# per corner while keeping the four corners distinguishable.
+# Minimum Euclidean separation between reported nutrient configurations.
 EPSILON = 1.0
 N_RANDOM = 1000
 N_TOP = 30
@@ -117,8 +99,7 @@ def main():
         if all(np.linalg.norm(x - x_other) >= EPSILON for x_other, _ in final):
             final.append((x, L_val))
 
-    # Classify each optimum by which pair-corner it is closest to.
-    # P_i = high on resources (i, i+1) modulo 4; LO elsewhere.
+    # Classify each solution by its nearest species-specific nutrient configuration.
     pair_templates = {
         'P1 (N1: R1,R2)': np.array([R_MAX, R_MAX, R_MIN, R_MIN]),
         'P2 (N2: R2,R3)': np.array([R_MIN, R_MAX, R_MAX, R_MIN]),

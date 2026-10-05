@@ -1,16 +1,6 @@
-"""Example: 3D fermentation batch bioreactor on a cached steady flow.
+"""Run a 3D batch bioreactor simulation on flow_cache.h5.
 
-Runs one representative local optimum (from ``find_optima.py``) through
-the closed cylindrical reactor (no inlet, no outlet — a sealed batch
-fermentation).  The flow field is loaded from ``flow_cache.h5``
-produced once by ``scripts/solve_flow.py``.
-
-Channels: [N1..N4, L, R1..R4, T1..T4].
-
-Usage:
-    python scripts/solve_flow.py --out flow_cache.h5     # once
-    python examples/find_optima.py                       # well-mixed search
-    python examples/example.py                           # 3D render
+Create the cache first with: python examples/solve_flow.py
 """
 
 import sys, os, time
@@ -19,9 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from CooperativeModel import Simulator
 
 
-# One of the four pair-corner optima from the well-mixed Liebig
-# consumer-resource model.  Pair P_1 = {R1, R2}: load R1 and R2 high,
-# R3 and R4 low; species N_1 grows and dominates lactate production.
+# Initial nutrients favor species 1.
 S_HI = 2.0
 S_LO = 0.05
 N0 = 0.01

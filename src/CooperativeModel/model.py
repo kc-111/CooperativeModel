@@ -1,22 +1,7 @@
-"""3D bioreactor model combining reaction kinetics and advection.
+"""Reaction and advection on a fixed velocity field.
 
-The PDE system for each species y_k is
-
-    dy_k/dt = R_k(y) - nabla.(v y_k)
-
-State tensor shape convention:
-
-    Internal :  [B, 13, Nz, Ny, Nx]    (batch, channels, depth, height, width)
-    Solver   :  [B, 13 * Nz * Ny * Nx]  (flat vector for Tsit5)
-
-Channels: ``[N1..N4, L, R1..R4, T1..T4]``.  The velocity field is
-treated as fixed (cached from Stage 1); the well-mixed limit is recovered
-by passing zero velocity through ``simulate``.
-
-Mixing is driven entirely by chaotic advection from the non-axisymmetric
-impeller — there is no explicit sub-grid diffusion term.  First-order upwind
-on the advection step provides the modest numerical diffusion needed to keep
-sharp fronts well-resolved on the 32^3 grid.
+State shape: [B, 13, Nz, Ny, Nx]; solver states are flattened per sample.
+Channels: [N1..N4, L, R1..R4, T1..T4].
 """
 
 import torch
@@ -30,15 +15,10 @@ N_CHANNELS = 13
 
 
 def compute_cfl_limit(dx, dy, dz, vel_tensor=None, safety=0.4):
-    """CFL-limited time step for explicit advection in 3D.
+    """Return the advection time-step limit [h] from cell sizes and velocity.
 
-    Args:
-        dx, dy, dz: cell sizes.
-        vel_tensor: optional ``[1, 3, Nz, Ny, Nx]`` velocity field.
-        safety: safety factor (default 0.4).
-
-    Returns:
-        h_max_cfl: maximum stable time step [h].
+    vel_tensor has shape [1, 3, Nz, Ny, Nx]; absent or zero velocity
+    returns 10 hours.
     """
     h_min = min(dx, dy, dz)
     if vel_tensor is None:
@@ -50,17 +30,11 @@ def compute_cfl_limit(dx, dy, dz, vel_tensor=None, safety=0.4):
 
 
 class BioreactorRHS:
-    """RHS callable for the 3D bioreactor PDE.
+    """Reaction-advection RHS with internal state reshaping.
 
-    Signature ``__call__(t, y_flat, args)`` matches the Tsit5 solver
-    interface; reshaping between flat and spatial layouts is internal.
-
-    Args:
-        params: dict from ``ModelParameters.to_tensors()``.
-        grid_cfg: ``GridConfig`` instance.
-        velocity_field:   ``[1, 3, Nz, Ny, Nx]`` velocity field.
-        wall_mask:        optional ``[1, 1, Nz, Ny, Nx]`` wall mask
-                          (1 = wall, 0 = fluid).
+    params comes from ModelParameters.to_tensors(); grid_cfg is GridConfig.
+    velocity_field has shape [1, 3, Nz, Ny, Nx]. The optional wall_mask
+    has shape [1, 1, Nz, Ny, Nx], with 1=wall and 0=fluid.
     """
 
     def __init__(self, params, grid_cfg, velocity_field, wall_mask=None):
@@ -81,9 +55,7 @@ class BioreactorRHS:
         B = y_flat.shape[0]
         y = y_flat.reshape(B, N_CHANNELS, self.Nz, self.Ny, self.Nx)
 
-        # Clamp non-negative before kinetics; intermediate RK stages can
-        # otherwise produce small negative concentrations that feed back into
-        # the rate laws.
+        # Clamp negative intermediate stages before evaluating kinetics.
         y = y.clamp(min=0.0)
 
         dydt = compute_reaction_rates(y, self.params)
@@ -95,20 +67,12 @@ class BioreactorRHS:
 
 
 def simulate(config, initial_state, velocity_field=None, wall_mask=None):
-    """Run a 3D bioreactor simulation on a fixed velocity field.
+    """Integrate reactions and transport on a fixed velocity field.
 
-    Args:
-        config: ``SimulationConfig`` instance.
-        initial_state: ``[B, 13, Nz, Ny, Nx]`` initial condition tensor.
-        velocity_field: optional ``[1, 3, Nz, Ny, Nx]`` velocity field
-                        (broadcasts over the batch).  ``None`` ⇒ zero
-                        velocity (well-mixed / 0D limit).
-        wall_mask:      optional ``[1, 1, Nz, Ny, Nx]`` wall mask
-                        (1 = wall, 0 = fluid).
-
-    Returns:
-        results: ``[B, n_output, 13, Nz, Ny, Nx]``.
-        t_eval:  ``[n_output]``.
+    initial_state: [B, 13, Nz, Ny, Nx].
+    velocity_field: optional [1, 3, Nz, Ny, Nx]; None uses zero velocity.
+    wall_mask: optional [1, 1, Nz, Ny, Nx], with 1=wall and 0=fluid.
+    Returns results [B, n_output, 13, Nz, Ny, Nx] and t_eval [n_output].
     """
     device = config.device
     dtype = config.dtype

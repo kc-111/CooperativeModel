@@ -1,26 +1,4 @@
-"""Stage-2 simulator: species transport on a cached steady flow.
-
-The flow field is produced once by ``scripts/solve_flow.py`` and reloaded
-from HDF5; ``Simulator(...).run()`` is the BO-loop entry point and never
-re-solves the flow.  Pass ``flow_cache_path=None`` to recover the
-well-mixed (0D-equivalent) limit by running with zero velocity and a
-single-cell grid, which is what ``examples/example_ode.py`` does.
-
-Channel ordering is ``[N1..N4, L, R1..R4, T1..T4]`` (13 channels)::
-
-    from CooperativeModel import Simulator
-
-    # Multi-sample run on the cached 32^3 flow.
-    r = Simulator(
-        N1=[0.01]*5, N2=[0.01]*5, N3=[0.01]*5, N4=[0.01]*5,
-        R1=[2.0, 1.5, 1.0, 0.5, 2.0], R2=2.0, R3=0.05, R4=0.05,
-        grid_shape=(32, 32, 32),
-        flow_cache_path='flow_cache.h5',
-        t_final=24.0,
-    ).run()
-    print(r.L_final)
-    r.gif('sample0.gif', sample=0)
-"""
+"""Simulation interface and results for cached-flow and well-mixed runs."""
 
 import time
 import torch
@@ -43,16 +21,10 @@ L_CH = 4
 
 
 class SimResults:
-    """Results from a 3D simulation.
+    """Simulation fields, fluid averages, and visualizations.
 
-    Internal state tensor: ``[B, T, 13, Nz, Ny, Nx]``.  Spatial averages and
-    finals are taken **only over fluid cells** (the wall mask is honoured),
-    so wall voxels do not dilute the reported means.
-
-    For B > 1 scalar properties return numpy arrays of shape ``[B]``;
-    ``spatial_average()`` returns ``[B, T, 13]``.  Visualisation methods
-    accept a ``sample`` index (default 0) and render a mid-z slice with
-    the wall boundary overlaid as a contour.
+    Fields have shape [B, T, 13, Nz, Ny, Nx]; averages exclude wall cells.
+    Final-value properties return scalars for B=1 and arrays [B] otherwise.
     """
 
     def __init__(self, results, t_eval, elapsed, grid_cfg, fluid_mask):
@@ -155,23 +127,11 @@ class SimResults:
 
     def gif(self, path='simulation.gif', curve_channels=None, sample=0,
             view='midz'):
-        """Save an animated GIF with fluid-averaged time-series curves.
+        """Save animated fields and fluid-averaged time series.
 
-        Args:
-            path: output file path.
-            curve_channels: channels to plot as time series (default: all
-                channels, automatically split into a biomass+product panel
-                and a resource panel so each is auto-scaled to its own
-                data range).
-            sample: sample index to visualise.
-            view: ``'midz'`` (default) renders the mid-z (xy) slice;
-                  ``'midy'`` renders the mid-y vertical (xz) slice through
-                  the impeller — full reactor height visible;
-                  ``'midx'`` renders the mid-x vertical (yz) slice;
-                  ``'topdown'`` renders a z-aggregated fluid-mean view
-                  (top-down looking down the cylinder axis);
-                  ``'ortho'`` renders mid-z + mid-y + mid-x side-by-side
-                  per channel.
+        curve_channels selects time-series channels; None plots all channels.
+        sample selects the batch member. Views: midz (XY), midy (XZ),
+        midx (YZ), topdown (average along z), or ortho (three mid-plane slices).
         """
         if curve_channels is None:
             curve_channels = list(range(N_CHANNELS))
@@ -259,44 +219,19 @@ class SimResults:
 
 
 class Simulator:
-    """3D bioreactor simulator with multi-sample support.
+    """Simulate one or more initial nutrient configurations.
 
     Args:
-        N1, N2, N3, N4, L, R1, R2, R3, R4, T1, T2, T3, T4:
-            per-channel initial concentrations (uniform over fluid cells).
-            Each can be a scalar or a 1-D sequence/tensor of length B
-            (multi-sample run).
-        samples: optional ``[B, 13]`` tensor (or nested list) of full
-            initial conditions; overrides the per-channel arguments.
-        t_final: integration time [hours].  Default 24.
-        n_output: number of output time points.  Default 49.
-        grid_shape: ``(Nz, Ny, Nx)``.  Default ``(32, 32, 32)``.  Use
-            ``(1, 1, 1)`` together with ``flow_cache_path=None`` for the
-            well-mixed (0D-equivalent) limit.
-        flow_cache_path: path to the HDF5 cache produced by
-            ``scripts/solve_flow.py``.  When ``None`` the simulation runs
-            with zero velocity and an all-fluid mask of the requested
-            ``grid_shape`` (well-mixed regime).
-        mixing_scale: multiplier on the cached velocity field.  Default
-            1.0.  Ignored when ``flow_cache_path is None``.
-        ic_mode: ``'uniform'`` (default) loads each species into every
-            fluid cell at its specified value.
-            ``'octant'`` loads each species into a single octant of the
-            vessel only (zero elsewhere) so chaotic advection has visible
-            work to do; useful for visualisation and mixing diagnostics.
-        ic_octant: 3-tuple of +-1 selecting which octant to fill when
-            ``ic_mode='octant'``.  Default ``(+1, +1, +1)``.  Ignored when
-            ``ic_mode='uniform'``.
-        device: 'cpu' or 'cuda'.
-
-    Example::
-
-        r = Simulator(samples=[[0.01, 0.01, 0.01, 0.01, 0.0,
-                                 2, 2, 0.05, 0.05,
-                                 0.0, 0.0, 0.0, 0.0]],
-                      grid_shape=(32, 32, 32),
-                      flow_cache_path='flow_cache.h5',
-                      t_final=24.0).run()
+        N1..N4, L, R1..R4, T1..T4: Scalar concentrations or sequences of length B.
+        samples: Optional [B, 13] initial states; overrides channel arguments.
+        t_final: Integration time [h].
+        n_output: Number of recorded times.
+        grid_shape: (Nz, Ny, Nx); use (1, 1, 1) for a well-mixed run.
+        flow_cache_path: HDF5 flow cache; None uses zero velocity and no walls.
+        mixing_scale: Multiplier for cached velocities.
+        ic_mode: uniform or octant initial conditions.
+        ic_octant: Signs (+1 or -1) selecting the loaded octant.
+        device: Tensor device.
     """
 
     def __init__(self, N1=0.01, N2=0.01, N3=0.01, N4=0.01, L=0.0,

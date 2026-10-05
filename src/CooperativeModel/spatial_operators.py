@@ -1,24 +1,4 @@
-"""Spatial operators for 3D reaction-advection simulations.
-
-Advection  : conservative first-order upwind for -nabla.(v c) on six cardinal
-             faces, with an open-face MAC stencil that matches the divergence
-             operator the flow-solver projection drives to zero.  This makes
-             the operator mass-conserving by construction (every face flux
-             enters two cells with opposite signs) and keeps an initially-
-             uniform field exactly uniform under the converged flow.
-
-Mixing is driven by chaotic advection from the non-axisymmetric impeller; no
-explicit diffusion operator is provided.  The first-order upwind already
-contributes the modest numerical diffusion needed to smooth steep fronts on
-the 32^3 grid.
-
-Shape conventions
------------------
-    c    : [B, C, Nz, Ny, Nx]
-    vel  : either [B, 3, Nz, Ny, Nx] (shared across species; channels
-           [vx, vy, vz]) or [B, 3*C, Nz, Ny, Nx] for per-species velocities.
-    wall_mask : [1, 1, Nz, Ny, Nx], 1 = wall, 0 = fluid.
-"""
+"""Conservative first-order upwind advection with zero wall flux."""
 
 import torch
 import torch.nn.functional as F
@@ -28,31 +8,11 @@ _PAD_3D = (1, 1, 1, 1, 1, 1)  # F.pad expects (W_l, W_r, H_l, H_r, D_l, D_r)
 
 
 class Advection:
-    """3D ``-nabla . (v c)`` via conservative first-order upwind on the six
-    cardinal faces.
+    """Compute -div(v*c) using conservative first-order upwind fluxes.
 
-    The face-velocity convention matches the MAC-style stencil that
-    :func:`flow_3d._div` projects onto in the flow solver: each cell-centred
-    component is reinterpreted as the velocity on one specific face.
-    Concretely, ``u[k,j,i]`` is the velocity on the **-x face** of cell
-    ``(k,j,i)`` (equivalently the +x face of cell ``(k,j,i-1)``); analogous
-    for ``v`` (-y face) and ``w`` (-z face).  With this convention,
-
-        div_flux[i] = (u[i+1] - u[i]) / dx + ...
-
-    matches the operator the pressure projection drives to zero, so an
-    initially-uniform field stays exactly uniform under a converged flow
-    instead of being amplified by spurious sources at fluid-wall interfaces.
-
-    The previous *centred face* averaging (``vx_xp = 0.5*(u[i]+u[i+1])``)
-    produced a different divergence — central-difference, which the flow
-    solver does *not* enforce — and could grow a uniform IC by 300x within
-    a few hours at the cylinder wall.
-
-    Args:
-        dx, dy, dz: cell sizes in each direction.
-        wall_mask:  optional ``[1, 1, Nz, Ny, Nx]`` binary mask
-                    (1 = wall, 0 = fluid).  Output is zeroed inside walls.
+    Stored velocity components lie on the negative x, y, and z cell faces,
+    matching the flow solver divergence. dx, dy, dz are cell sizes.
+    The optional wall_mask is [1, 1, Nz, Ny, Nx], with 1=wall and 0=fluid.
     """
 
     def __init__(self, dx, dy=None, dz=None, wall_mask=None):
@@ -64,11 +24,7 @@ class Advection:
             fluid = 1.0 - wall_mask
             Nz, Ny, Nx = fluid.shape[-3], fluid.shape[-2], fluid.shape[-1]
             fp = F.pad(fluid, _PAD_3D, mode='constant', value=0.0)
-            # Open-face indicators (face is open iff both adjacent cells are
-            # fluid).  With the MAC convention used below, the +x face of cell
-            # (k,j,i) sits between cells (k,j,i) and (k,j,i+1) and carries
-            # velocity u[k,j,i+1]; the -x face carries u[k,j,i].  The face is
-            # open when both adjacent cells are fluid.
+            # Faces are open only when both adjacent cells are fluid.
             self._open_xp = fluid * fp[..., 1:1 + Nz, 1:1 + Ny, 2:2 + Nx]
             self._open_xm = fluid * fp[..., 1:1 + Nz, 1:1 + Ny, 0:Nx]
             self._open_yp = fluid * fp[..., 1:1 + Nz, 2:2 + Ny, 1:1 + Nx]
@@ -108,9 +64,7 @@ class Advection:
         c_zp = c_pad[..., 2:2 + Nz, 1:1 + Ny, 1:1 + Nx]
         c_zm = c_pad[..., 0:Nz,     1:1 + Ny, 1:1 + Nx]
 
-        # MAC-style face velocities (no averaging).  ``u[k,j,i]`` is the
-        # -x face velocity of cell ``(k,j,i)``.  Therefore the +x face
-        # velocity of cell ``(k,j,i)`` is ``u[k,j,i+1]``.
+        # Stored velocities lie on negative faces; positive faces use neighboring cells.
         vxp = F.pad(vx, (1, 1, 0, 0, 0, 0), mode='replicate')
         vx_xp = vxp[..., 2:2 + Nx]            # +x face = u[i+1]
         vx_xm = vxp[..., 1:1 + Nx]            # -x face = u[i]
